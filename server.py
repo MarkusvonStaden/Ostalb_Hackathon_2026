@@ -27,11 +27,14 @@ class PointsPayload(BaseModel):
     # [x, y]-Punkt der Fehlerstelle in normalisierten Region-Koordinaten
     # oder ``None``. Länge muss ``len(points) // 4`` sein.
     errors: list[list[float] | None] | None = None
+    # Optional: pro Brett True wenn eine Hand darüber erkannt wurde.
+    hovers: list[bool] | None = None
 
 
 # Aktuell zu projizierende Punkte (normalisiert, 0..1).
 _current_points: list[tuple[float, float]] = []
 _current_errors: list[list[float] | None] = []
+_current_hovers: list[bool] = []
 
 # WebSocket-Clients, die Punkt-Updates abonnieren.
 _ws_clients: set[WebSocket] = set()
@@ -46,10 +49,12 @@ async def _capture_loop() -> None:
 
 
 async def _broadcast_points(points: list[tuple[float, float]],
-                            errors: list[list[float] | None] | None = None) -> None:
+                            errors: list[list[float] | None] | None = None,
+                            hovers: list[bool] | None = None) -> None:
     msg = {
         "points": [list(p) for p in points],
         "errors": [list(e) if e is not None else None for e in (errors or [])],
+        "hovers": list(hovers) if hovers else [],
     }
     with _ws_lock:
         clients = list(_ws_clients)
@@ -147,6 +152,8 @@ INDEX_HTML = """<!doctype html>
   let points = [];
   // Pro Brett (= je 4 Punkte in `points`) entweder [x,y] oder null.
   let errors = [];
+  // Pro Brett true wenn eine Hand darüber erkannt wurde.
+  let hovers = [];
   let cssW = 0, cssH = 0;
 
   // Kalibrierung: vier Ecken in normalisierten Canvas-Koordinaten (0..1).
@@ -682,6 +689,39 @@ INDEX_HTML = """<!doctype html>
 
     // Pulsierende Fehler-Ränder + Marker (über allem).
     drawErrorOverlays(mapped);
+    drawHoverOverlays(mapped);
+  }
+
+  function drawHoverOverlays(mapped) {
+    if (!hovers || !hovers.some(h => h)) return;
+    const t = performance.now() / 1000;
+    const pulse = 0.5 + 0.5 * Math.sin(t * Math.PI * 2 * 1.5); // 1.5 Hz, 0..1
+    ctx.save();
+    for (let i = 0; i + 4 <= mapped.length; i += 4) {
+      if (!hovers[i / 4]) continue;
+      const quad = mapped.slice(i, i + 4);
+      let cx = 0, cy = 0;
+      for (const [x, y] of quad) { cx += x; cy += y; }
+      cx /= 4; cy /= 4;
+
+      const baseR = Math.max(14, Math.min(cssW, cssH) * 0.028);
+      const r = baseR * (0.7 + 0.3 * pulse);
+
+      ctx.globalAlpha = 0.4 + 0.3 * pulse;
+      ctx.strokeStyle = '#22c55e';
+      ctx.lineWidth = Math.max(2, baseR * 0.18);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * 1.6, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.globalAlpha = 0.7 + 0.3 * pulse;
+      ctx.fillStyle = '#22c55e';
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
   }
 
   function drawErrorOverlays(mapped) {
@@ -997,8 +1037,9 @@ INDEX_HTML = """<!doctype html>
         lastTargetTs = nowTs;
         targetPoints = newTarget;
         targetErrors = stab.errors;
-        // Errors direkt übernehmen (sie werden nicht animiert).
+        // Errors und Hovers direkt übernehmen (sie werden nicht animiert).
         errors = targetErrors.slice();
+        hovers = Array.isArray(data.hovers) ? data.hovers.slice() : [];
         // Wenn die Anzahl wächst (neues Viereck): die zusätzlichen
         // Slots direkt am Ziel einrasten, damit sie nicht aus dem
         // (0,0)-Default heran-animieren. Bestehende Slots laufen
@@ -1079,8 +1120,9 @@ INDEX_HTML = """<!doctype html>
           changed = true;
         }
       }
-      if (changed) draw();
     }
+    // Hovers pulsieren kontinuierlich → immer neu zeichnen wenn aktiv.
+    if (changed || (hovers && hovers.some(h => h))) draw();
     requestAnimationFrame(animate);
   }
   requestAnimationFrame(animate);
@@ -1104,7 +1146,7 @@ def hello() -> HTMLResponse:
 
 @app.get("/points")
 def get_points() -> dict:
-    return {"points": _current_points, "errors": _current_errors}
+    return {"points": _current_points, "errors": _current_errors, "hovers": _current_hovers}
 
 
 @app.post("/points")
@@ -1129,10 +1171,16 @@ async def set_points(payload: PointsPayload) -> dict:
             ey = max(0.0, min(1.0, float(e[1])))
             cleaned_errors[i] = [ex, ey]
 
-    global _current_points, _current_errors
+    cleaned_hovers: list[bool] = [False] * n_quads
+    if payload.hovers is not None:
+        for i, h in enumerate(payload.hovers[:n_quads]):
+            cleaned_hovers[i] = bool(h)
+
+    global _current_points, _current_errors, _current_hovers
     _current_points = cleaned
     _current_errors = cleaned_errors
-    await _broadcast_points(cleaned, cleaned_errors)
+    _current_hovers = cleaned_hovers
+    await _broadcast_points(cleaned, cleaned_errors, cleaned_hovers)
     return {"count": len(cleaned), "errors": sum(1 for e in cleaned_errors if e is not None)}
 
 
@@ -1146,6 +1194,7 @@ async def ws_points(ws: WebSocket) -> None:
         await ws.send_json({
             "points": [list(p) for p in _current_points],
             "errors": [list(e) if e is not None else None for e in _current_errors],
+            "hovers": list(_current_hovers),
         })
         while True:
             # Wir erwarten keine Nachrichten vom Client; receive blockiert,
