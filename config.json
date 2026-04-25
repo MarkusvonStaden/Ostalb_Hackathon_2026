@@ -7,7 +7,8 @@
     "enabled": true,
     "show_preview": false,
     "rotate": 180,
-    "threshold": -1
+    "threshold": -1,
+    "contour_channel": "blue"
   },
   "server": {
     "url": "http://127.0.0.1:8000/",

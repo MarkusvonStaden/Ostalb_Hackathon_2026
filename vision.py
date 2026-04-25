@@ -20,6 +20,28 @@ def to_bgr(img: np.ndarray) -> np.ndarray:
     return img
 
 
+# Channels werden in BGR-Reihenfolge ausgewertet (OpenCV-Default).
+_CHANNEL_INDEX = {"blue": 0, "green": 1, "red": 2}
+
+
+def to_intensity(img: np.ndarray, mode: str = "blue") -> np.ndarray:
+    """Liefert ein Single-Channel-Bild für die Konturen-Pipeline.
+
+    ``mode='blue'`` blendet rote Projektionslinien weitgehend aus, weil rotes
+    Licht im Blau-Kanal kaum Energie trägt. ``mode='gray'`` entspricht dem
+    klassischen ``cv2.cvtColor(BGR2GRAY)`` (Regressions-Schalter).
+    """
+    if img.ndim == 2:
+        return img
+    m = (mode or "blue").lower()
+    if m == "gray":
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    idx = _CHANNEL_INDEX.get(m)
+    if idx is None:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return img[:, :, idx]
+
+
 def resize_panel(img: np.ndarray) -> np.ndarray:
     img = to_bgr(img)
     h, w = img.shape[:2]
@@ -78,11 +100,15 @@ def draw_tag_connections(img: np.ndarray, corners) -> None:
         cv2.circle(img, tuple(p), 6, (0, 0, 255), -1, lineType=cv2.LINE_AA)
 
 
-def build_display(frame, gray, thresh_img, contour_img, corners, ids, region: np.ndarray | None) -> np.ndarray:
+def build_display(frame, gray, thresh_img, contour_img, corners, ids, region: np.ndarray | None, channel: str = "blue") -> np.ndarray:
     original_panel = frame.copy()
     gray_panel = to_bgr(gray)
-    thresh_title = "Threshold (between tags)" if region is not None else "Threshold"
-    contour_title = "Contours (between tags)" if region is not None else "Contours"
+    chan_label = (channel or "blue").lower()
+    chan_suffix = f" [{chan_label}]"
+    thresh_title = ("Threshold (between tags)" if region is not None else "Threshold") + chan_suffix
+    contour_title = ("Contours (between tags)" if region is not None else "Contours") + chan_suffix
+    gray_title_base = "Grayscale (between tags)" if region is not None else "Grayscale"
+    gray_title = gray_title_base + chan_suffix
 
     if ids is not None and len(ids) > 0:
         cv2.aruco.drawDetectedMarkers(original_panel, corners, ids)
@@ -92,7 +118,7 @@ def build_display(frame, gray, thresh_img, contour_img, corners, ids, region: np
             draw_tag_connections(gray_panel, corners)
 
     tl = label(resize_panel(original_panel), "Original (ArUco + lines)")
-    tr = label(resize_panel(gray_panel), "Grayscale (between tags)" if region is not None else "Grayscale")
+    tr = label(resize_panel(gray_panel), gray_title)
     bl = label(resize_panel(to_bgr(thresh_img)), thresh_title)
     br = label(resize_panel(to_bgr(contour_img)), contour_title)
 
@@ -112,8 +138,15 @@ def build_display(frame, gray, thresh_img, contour_img, corners, ids, region: np
 def process_frame(
     frame: np.ndarray,
     return_stages: bool = False,
+    contour_channel: str = "blue",
 ):
-    """Erkenne Bretter-Eckpunkte in einem BGR-Frame."""
+    """Erkenne Bretter-Eckpunkte in einem BGR-Frame.
+
+    ``contour_channel`` steuert, welches Single-Channel-Bild für die
+    Threshold-/Konturen-Pipeline verwendet wird. Default ``"blue"`` blendet
+    rotes Projektor-Eigenlicht weitgehend aus. ArUco bleibt auf klassischen
+    Graustufen, weil die Marker schwarz/weiß sind.
+    """
     h, w = frame.shape[:2]
     if max(h, w) > MAX_DIM:
         scale = MAX_DIM / max(h, w)
@@ -131,9 +164,9 @@ def process_frame(
         region = extract_between_tags(frame, corners)
 
     if region is not None:
-        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        gray = to_intensity(region, contour_channel)
     else:
-        gray = gray_full
+        gray = to_intensity(frame, contour_channel)
 
     blurred = cv2.GaussianBlur(gray, (1, 1), 0)
     # Invertiert: Bretter (dunkel) -> weiß; nötig für RETR_EXTERNAL,
@@ -185,6 +218,7 @@ def process_frame(
         "corners": corners,
         "ids": ids,
         "region": region,
+        "contour_channel": contour_channel,
     }
     return result, stages
 
@@ -232,6 +266,7 @@ def run_webcam(
     width: int | None = None,
     height: int | None = None,
     rotate: int = 0,
+    contour_channel: str = "blue",
 ) -> None:
     """Liest kontinuierlich von der Webcam, erkennt Bretter und sendet sie an den Server.
 
@@ -268,14 +303,14 @@ def run_webcam(
                 last_send = now
                 try:
                     if show:
-                        contours, stages = process_frame(frame, return_stages=True)
+                        contours, stages = process_frame(frame, return_stages=True, contour_channel=contour_channel)
                         last_panel = build_display(
                             stages["frame"], stages["gray"], stages["thresh"],
                             stages["contour_img"], stages["corners"], stages["ids"],
-                            stages["region"],
+                            stages["region"], stages.get("contour_channel", contour_channel),
                         )
                     else:
-                        contours = process_frame(frame)
+                        contours = process_frame(frame, contour_channel=contour_channel)
                     flat = [[float(x), float(y)] for c in contours for x, y in c]
                     _post_points(flat, server_url)
                     if show is False:
@@ -322,17 +357,20 @@ def main() -> None:
     parser.add_argument("--rotate", type=int, default=int(cam.get("rotate", 0)),
                         choices=[0, 90, 180, 270],
                         help="Frame um 0/90/180/270 Grad drehen (Default aus Config).")
+    parser.add_argument("--contour-channel", default=cam.get("contour_channel", "blue"),
+                        choices=["blue", "green", "red", "gray"],
+                        help="Single-Channel für Threshold/Konturen. 'blue' blendet rote Projektion aus (Default aus Config).")
     args = parser.parse_args()
 
     frame = cv2.imread(args.image)
     if frame is None:
         raise SystemExit(f"Konnte Bild nicht laden: {args.image}")
-    contours, stages = process_frame(frame, return_stages=True)
+    contours, stages = process_frame(frame, return_stages=True, contour_channel=args.contour_channel)
     print(contours)
     display = build_display(
         stages["frame"], stages["gray"], stages["thresh"],
         stages["contour_img"], stages["corners"], stages["ids"],
-        stages["region"],
+        stages["region"], stages.get("contour_channel", args.contour_channel),
     )
     ph, pw = display.shape[:2]
     scale = min(MAX_DISPLAY_W / pw, MAX_DISPLAY_H / ph, 1.0)
