@@ -6,8 +6,8 @@ PANEL_H = 540          # unified panel height; width scales with aspect ratio
 REGION_ASPECT = 80 / 50  # width / height of the known region between markers
 REGION_THUMB_H = 320
 MAX_DIM = 1280         # longest edge cap before processing
-MAX_DISPLAY_W = 1800   # max breite des kombinierten Vorschau-Fensters in px
-MAX_DISPLAY_H = 900    # max höhe des kombinierten Vorschau-Fensters in px
+MAX_DISPLAY_W = 7680   # max breite des kombinierten Vorschau-Fensters in px
+MAX_DISPLAY_H = 4320   # max höhe des kombinierten Vorschau-Fensters in px
 # Region is 75 cm × 50 cm → perimeter = 250 cm
 # 15 cm / 250 cm = 0.06,  200 cm / 250 cm = 0.80
 CONTOUR_MIN_LEN = 0.06  # min arc length as fraction of region perimeter (2 * (w + h))
@@ -80,50 +80,40 @@ def draw_tag_connections(img: np.ndarray, corners) -> None:
 
 def build_display(frame, gray, thresh_img, contour_img, corners, ids, region: np.ndarray | None) -> np.ndarray:
     original_panel = frame.copy()
-    aruco_panel = frame.copy()
     gray_panel = to_bgr(gray)
-    thresh_panel = to_bgr(thresh_img)
-    gray_title = "Grayscale"
-    thresh_title = "Threshold"
-    contour_title = "Contours"
+    thresh_title = "Threshold (between tags)" if region is not None else "Threshold"
+    contour_title = "Contours (between tags)" if region is not None else "Contours"
 
     if ids is not None and len(ids) > 0:
         cv2.aruco.drawDetectedMarkers(original_panel, corners, ids)
-        cv2.aruco.drawDetectedMarkers(aruco_panel, corners, ids)
         draw_tag_connections(original_panel, corners)
 
-        # Only draw the tag-area outline when grayscale/contours are still full-frame.
         if len(ids) == 4 and region is None:
-            gray_panel = gray_panel.copy()
             draw_tag_connections(gray_panel, corners)
 
-    if region is not None:
-        gray_title = "Grayscale (between tags)"
-        thresh_title = "Threshold (between tags)"
-        contour_title = "Contours (between tags)"
+    tl = label(resize_panel(original_panel), "Original (ArUco + lines)")
+    tr = label(resize_panel(gray_panel), "Grayscale (between tags)" if region is not None else "Grayscale")
+    bl = label(resize_panel(to_bgr(thresh_img)), thresh_title)
+    br = label(resize_panel(to_bgr(contour_img)), contour_title)
 
-    panels = [label(resize_panel(original_panel), "Original (ArUco + lines)")]
+    # Alle vier Panels auf dieselbe Breite bringen, dann 2×2 zusammensetzen.
+    w = max(tl.shape[1], tr.shape[1], bl.shape[1], br.shape[1])
 
-    if region is not None:
-        panels.append(label(resize_panel(region), "Between tags"))
+    def pad_w(img):
+        if img.shape[1] < w:
+            img = cv2.copyMakeBorder(img, 0, 0, 0, w - img.shape[1], cv2.BORDER_CONSTANT)
+        return img
 
-    panels.append(label(resize_panel(gray_panel), gray_title))
-    panels.append(label(resize_panel(thresh_panel), thresh_title))
-    panels.append(label(resize_panel(to_bgr(contour_img)), contour_title))
-
-    return np.hstack(panels)
+    top = np.hstack([pad_w(tl), pad_w(tr)])
+    bot = np.hstack([pad_w(bl), pad_w(br)])
+    return np.vstack([top, bot])
 
 
 def process_frame(
     frame: np.ndarray,
     return_stages: bool = False,
-    threshold: int | None = None,
 ):
-    """Erkenne Bretter-Eckpunkte in einem BGR-Frame.
-
-    ``threshold``: Wenn ``None`` oder negativ, wird Otsu automatisch verwendet.
-    Andernfalls wird ein fester Schwellwert (0..255) auf den Rotkanal angewendet.
-    """
+    """Erkenne Bretter-Eckpunkte in einem BGR-Frame."""
     h, w = frame.shape[:2]
     if max(h, w) > MAX_DIM:
         scale = MAX_DIM / max(h, w)
@@ -145,13 +135,10 @@ def process_frame(
     else:
         gray = gray_full
 
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    if threshold is None or threshold < 0:
-        # Invertiert: Bretter (dunkel) -> weiß; nötig für RETR_EXTERNAL,
-        # damit findContours die Bretter und nicht den Hintergrund verfolgt.
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    else:
-        _, thresh = cv2.threshold(blurred, int(threshold), 255, cv2.THRESH_BINARY_INV)
+    blurred = cv2.GaussianBlur(gray, (1, 1), 0)
+    # Invertiert: Bretter (dunkel) -> weiß; nötig für RETR_EXTERNAL,
+    # damit findContours die Bretter und nicht den Hintergrund verfolgt.
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     # Nur ÄUSSERE Konturen, sonst werden Innen- und Außenrand der Bretter
     # doppelt gefunden und die Eck-Erkennung springt zwischen beiden.
     raw_contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -169,16 +156,11 @@ def process_frame(
     result = []
     quads_px: list[np.ndarray] = []
     for c in filtered_contours:
-        # Echte Polygon-Ecken via approxPolyDP – funktioniert auch für
-        # Rauten/Trapeze, im Gegensatz zu minAreaRect (das immer ein Rechteck
-        # liefert und so z. B. die Spitzen einer Raute verfehlt).
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.2 * peri, True)
-        if len(approx) == 4:
-            quad = approx.reshape(4, 2).astype(np.float32)
-        else:
-            # Fallback: minAreaRect, falls die Approximation kein Viereck liefert.
-            quad = cv2.boxPoints(cv2.minAreaRect(c)).astype(np.float32)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) != 4:
+            continue
+        quad = approx.reshape(4, 2).astype(np.float32)
         quads_px.append(quad.astype(np.int32))
         normalized = [[round(float(x) / nx, 4), round(float(y) / ny, 4)] for x, y in quad]
         result.append(normalized)
@@ -250,13 +232,10 @@ def run_webcam(
     width: int | None = None,
     height: int | None = None,
     rotate: int = 0,
-    threshold: int | None = None,
 ) -> None:
     """Liest kontinuierlich von der Webcam, erkennt Bretter und sendet sie an den Server.
 
     ``rotate`` dreht jeden Frame vor der Verarbeitung um 0/90/180/270 Grad.
-    ``threshold`` (0..255) verwendet einen festen Schwellwert; ``None`` oder -1
-    aktiviert Otsu-Auto-Threshold.
     """
     cap = _open_webcam(camera, width, height)
     period = 1.0 / max(0.1, fps)
@@ -267,17 +246,9 @@ def run_webcam(
     }.get(int(rotate) % 360)
     print(f"[vision] Webcam {camera} geöffnet – sende an {server_url} (rotate={rotate}°, Strg+C zum Beenden)")
 
-    # Threshold-State (per Trackbar im Preview-Fenster veränderbar).
-    # 256 = Otsu (Auto), 0..255 = fest.
     win_name = "vision (stages: original | region | gray | threshold | contours)"
-    thr_state = {"value": 256 if (threshold is None or threshold < 0) else int(threshold)}
     if show:
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        cv2.createTrackbar(
-            "threshold (256=Otsu)", win_name,
-            thr_state["value"], 256,
-            lambda v: thr_state.update(value=v),
-        )
 
     import time
     last_send = 0.0
@@ -296,16 +267,15 @@ def run_webcam(
             if now - last_send >= period:
                 last_send = now
                 try:
-                    cur_thr = None if thr_state["value"] >= 256 else thr_state["value"]
                     if show:
-                        contours, stages = process_frame(frame, return_stages=True, threshold=cur_thr)
+                        contours, stages = process_frame(frame, return_stages=True)
                         last_panel = build_display(
                             stages["frame"], stages["gray"], stages["thresh"],
                             stages["contour_img"], stages["corners"], stages["ids"],
                             stages["region"],
                         )
                     else:
-                        contours = process_frame(frame, threshold=cur_thr)
+                        contours = process_frame(frame)
                     flat = [[float(x), float(y)] for c in contours for x, y in c]
                     _post_points(flat, server_url)
                     if show is False:
@@ -319,10 +289,6 @@ def run_webcam(
                 scale = min(MAX_DISPLAY_W / pw, MAX_DISPLAY_H / ph, 1.0)
                 if scale < 1.0:
                     img = cv2.resize(img, (int(pw * scale), int(ph * scale)), interpolation=cv2.INTER_AREA)
-                # Aktuellen Threshold-Wert aufs Bild schreiben.
-                thr_label = "Otsu" if thr_state["value"] >= 256 else f"thr={thr_state['value']}"
-                cv2.putText(img, thr_label, (10, img.shape[0] - 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 cv2.imshow(win_name, img)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
                     break
@@ -345,7 +311,7 @@ def main() -> None:
     srv = cfg["server"]
 
     parser = argparse.ArgumentParser(description="Erkenne Bretter und sende Punkte an den Projektor-Server.")
-    parser.add_argument("--image", help="Statt Webcam: Bilddatei verarbeiten und Ergebnis ausgeben.")
+    parser.add_argument("--image", default="test.jpeg", help="Bilddatei verarbeiten und Ergebnis anzeigen (Default: test.jpeg).")
     parser.add_argument("--camera", type=int, default=cam["index"], help=f"Webcam-Index (Default {cam['index']}).")
     parser.add_argument("--server", default=srv["url"], help="URL des Projektor-Servers.")
     parser.add_argument("--fps", type=float, default=cam["fps"], help=f"Sende-/Verarbeitungsrate (Default {cam['fps']}).")
@@ -356,35 +322,25 @@ def main() -> None:
     parser.add_argument("--rotate", type=int, default=int(cam.get("rotate", 0)),
                         choices=[0, 90, 180, 270],
                         help="Frame um 0/90/180/270 Grad drehen (Default aus Config).")
-    parser.add_argument("--threshold", type=int,
-                        default=cam.get("threshold", -1),
-                        help="Fester Threshold 0..255; -1 = Otsu (Default aus Config).")
     args = parser.parse_args()
 
-    if args.image:
-        with open(args.image, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        contours = process_image(b64)
-        print(contours)
-        return
-
-    if args.show:
-        show = True
-    elif args.no_show:
-        show = False
-    else:
-        show = bool(cam.get("show_preview", False))
-
-    run_webcam(
-        camera=args.camera,
-        server_url=args.server,
-        fps=args.fps,
-        show=show,
-        width=args.width,
-        height=args.height,
-        rotate=args.rotate,
-        threshold=None if args.threshold is None or args.threshold < 0 else args.threshold,
+    frame = cv2.imread(args.image)
+    if frame is None:
+        raise SystemExit(f"Konnte Bild nicht laden: {args.image}")
+    contours, stages = process_frame(frame, return_stages=True)
+    print(contours)
+    display = build_display(
+        stages["frame"], stages["gray"], stages["thresh"],
+        stages["contour_img"], stages["corners"], stages["ids"],
+        stages["region"],
     )
+    ph, pw = display.shape[:2]
+    scale = min(MAX_DISPLAY_W / pw, MAX_DISPLAY_H / ph, 1.0)
+    if scale < 1.0:
+        display = cv2.resize(display, (int(pw * scale), int(ph * scale)), interpolation=cv2.INTER_AREA)
+    cv2.imshow("vision – " + args.image, display)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
