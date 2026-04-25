@@ -121,6 +121,11 @@ INDEX_HTML = """<!doctype html>
   const ASPECT_W = 2;
   const ASPECT_H = 3;
 
+  // Reale Größe des erkannten Bereichs (zwischen den ArUco-Markern) in mm.
+  // Muss zum REGION_ASPECT in vision.py passen (aktuell 87/47).
+  const REGION_W_MM = 870;
+  const REGION_H_MM = 470;
+
   const canvas = document.getElementById('stage');
   const ctx = canvas.getContext('2d');
   let points = [];
@@ -232,6 +237,59 @@ INDEX_HTML = """<!doctype html>
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fill();
+    }
+
+    // Maße in mm an die Kanten jedes 4er-Vierecks schreiben.
+    if (points.length >= 4) {
+      const fontPx = Math.max(12, Math.round(r * 1.4));
+      ctx.font = `bold ${fontPx}px system-ui, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      for (let i = 0; i + 4 <= points.length; i += 4) {
+        const quadN = points.slice(i, i + 4);   // normalisiert (0..1)
+        const quadP = mapped.slice(i, i + 4);    // CSS-Pixel
+        // Schwerpunkt des Vierecks (für Beschriftungs-Offset nach innen).
+        let cx = 0, cy = 0;
+        for (const [x, y] of quadP) { cx += x; cy += y; }
+        cx /= 4; cy /= 4;
+        for (let j = 0; j < 4; j++) {
+          const k = (j + 1) % 4;
+          const dxN = (quadN[k][0] - quadN[j][0]) * REGION_W_MM;
+          const dyN = (quadN[k][1] - quadN[j][1]) * REGION_H_MM;
+          const mm = Math.hypot(dxN, dyN);
+          const label = `${mm.toFixed(0)} mm`;
+
+          const mxp = (quadP[j][0] + quadP[k][0]) / 2;
+          const myp = (quadP[j][1] + quadP[k][1]) / 2;
+
+          // Richtung der Kante in Pixeln (zum Drehen der Schrift).
+          const ex = quadP[k][0] - quadP[j][0];
+          const ey = quadP[k][1] - quadP[j][1];
+          let angle = Math.atan2(ey, ex);
+          // Schrift nicht "auf dem Kopf" zeigen.
+          if (angle > Math.PI / 2) angle -= Math.PI;
+          if (angle < -Math.PI / 2) angle += Math.PI;
+
+          // Senkrecht zur Kante nach innen (Richtung Schwerpunkt) versetzen,
+          // damit die Linie nicht überschrieben wird.
+          const elen = Math.hypot(ex, ey) || 1;
+          let nx = -ey / elen, ny = ex / elen;       // Normale zur Kante
+          if ((cx - mxp) * nx + (cy - myp) * ny < 0) { nx = -nx; ny = -ny; }
+          const off = fontPx * 0.85;
+          const tx = mxp + nx * off;
+          const ty = myp + ny * off;
+
+          ctx.save();
+          ctx.translate(tx, ty);
+          ctx.rotate(angle);
+          const tw = ctx.measureText(label).width;
+          ctx.fillStyle = 'rgba(0,0,0,0.6)';
+          ctx.fillRect(-tw / 2 - 4, -fontPx / 2 - 2, tw + 8, fontPx + 4);
+          ctx.fillStyle = '#ffd34d';
+          ctx.fillText(label, 0, 0);
+          ctx.restore();
+        }
+      }
     }
 
     if (calibrating) drawCalibrationOverlay();
@@ -355,6 +413,115 @@ INDEX_HTML = """<!doctype html>
   });
 
   // ---- WebSocket: laufende Punkt-Updates ----
+  // Stabilisierung: neue Vierecke werden per Schwerpunkt-Distanz auf die
+  // bisherigen abgebildet; jeder Eckpunkt wird über einen Tiefpass geglättet
+  // und nur übernommen, wenn die Bewegung eine Totzone überschreitet.
+  // Dadurch zittern die Brett-Konturen nicht mehr im Takt der Erkennung.
+  const SMOOTH_ALPHA = 0.25;        // Anteil des neuen Werts (0..1, klein = ruhiger)
+  const DEAD_ZONE = 0.004;          // < 0.4 % vom Bild -> ignorieren (Rauschen)
+  const SNAP_DIST = 0.06;           // > 6 %  -> direkt übernehmen (echte Bewegung)
+  const HOLD_MS = 1500;             // wie lange ein Viereck gehalten wird, das gerade nicht erkannt wurde
+  function chunkQuads(arr) {
+    const out = [];
+    for (let i = 0; i + 4 <= arr.length; i += 4) out.push(arr.slice(i, i + 4));
+    return out;
+  }
+  function centroid(quad) {
+    let cx = 0, cy = 0;
+    for (const [x, y] of quad) { cx += x; cy += y; }
+    return [cx / 4, cy / 4];
+  }
+  // Beste Eck-Rotation (0..3) finden, sodass die Punkte bestmöglich passen.
+  function bestRotation(prev, next) {
+    let bestRot = 0, bestSum = Infinity;
+    for (let r = 0; r < 4; r++) {
+      let sum = 0;
+      for (let i = 0; i < 4; i++) {
+        const a = prev[i], b = next[(i + r) % 4];
+        sum += Math.hypot(a[0] - b[0], a[1] - b[1]);
+      }
+      if (sum < bestSum) { bestSum = sum; bestRot = r; }
+    }
+    return bestRot;
+  }
+  function smoothPoint(prev, next) {
+    const dx = next[0] - prev[0], dy = next[1] - prev[1];
+    const d = Math.hypot(dx, dy);
+    if (d < DEAD_ZONE) return prev;            // zu klein: ignorieren
+    if (d > SNAP_DIST) return next;            // große Bewegung: direkt
+    return [prev[0] + dx * SMOOTH_ALPHA, prev[1] + dy * SMOOTH_ALPHA];
+  }
+
+  // Tracker: jedes Viereck behält über Frames hinweg seinen Slot, auch
+  // wenn es einzelne Frames lang nicht erkannt wird. Das verhindert das
+  // kurzzeitige "Ausblenden" der Projektion, sobald die Erkennung mal
+  // einen Frame aussetzt – solange überhaupt etwas erkannt wird (oder
+  // die HOLD_MS-Frist nicht abgelaufen ist), bleibt das letzte bekannte
+  // Viereck stehen.
+  let tracked = [];   // Array von { pts: [[x,y]*4], lastSeenAt: ms }
+
+  // Animation: zwischen WebSocket-Updates wird kontinuierlich (per
+  // requestAnimationFrame) zwischen den aktuell gezeichneten Punkten
+  // (`points`) und dem zuletzt empfangenen Ziel (`targetPoints`)
+  // interpoliert. Dadurch entstehen weiche Bewegungen statt Ruckler im
+  // 5-fps-Takt der Kamera.
+  let targetPoints = [];
+  const ANIM_ALPHA = 0.18;          // Annäherung pro Frame (0..1)
+  const ANIM_SNAP_DIST = 0.08;      // große Sprünge nicht weichzeichnen
+  const ANIM_MIN_STEP = 0.0008;     // unter diesem Rest-Delta direkt einrasten
+  function stabilizePoints(incoming) {
+    const newQuads = chunkQuads(incoming);
+    const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+    // 1) Bestehende Tracks per Centroid-Distanz greedy zu neuen Vierecken
+    //    zuordnen. Tracks behalten ihren Slot/Index – so bleibt die
+    //    Reihenfolge der Ausgabe stabil (wichtig für die Animations-
+    //    interpolation, die per Index arbeitet).
+    const trackCent = tracked.map(t => centroid(t.pts));
+    const usedTrack = new Array(tracked.length).fill(false);
+    const newToTrack = new Array(newQuads.length).fill(-1);
+    const order = newQuads.map((q, i) => ({ i, c: centroid(q) }));
+    for (const { i, c } of order) {
+      let best = -1, bestD = Infinity;
+      for (let t = 0; t < tracked.length; t++) {
+        if (usedTrack[t]) continue;
+        const d = Math.hypot(c[0] - trackCent[t][0], c[1] - trackCent[t][1]);
+        if (d < bestD) { bestD = d; best = t; }
+      }
+      if (best >= 0 && bestD < 0.25) { newToTrack[i] = best; usedTrack[best] = true; }
+    }
+
+    // 2) Zugeordnete Tracks aktualisieren (mit Eckrotation + Glättung).
+    for (let i = 0; i < newQuads.length; i++) {
+      const tIdx = newToTrack[i];
+      if (tIdx < 0) continue;
+      const prev = tracked[tIdx].pts;
+      const rot = bestRotation(prev, newQuads[i]);
+      const aligned = Array.from({ length: 4 }, (_, k) => newQuads[i][(k + rot) % 4]);
+      tracked[tIdx].pts = aligned.map((p, k) => smoothPoint(prev[k], p));
+      tracked[tIdx].lastSeenAt = now;
+    }
+
+    // 3) Neue Vierecke (ohne Match) als frische Tracks anhängen.
+    for (let i = 0; i < newQuads.length; i++) {
+      if (newToTrack[i] >= 0) continue;
+      tracked.push({
+        pts: newQuads[i].map(p => p.slice()),
+        lastSeenAt: now,
+      });
+    }
+
+    // 4) Tracks, die zu lange nicht mehr gesehen wurden, entfernen.
+    //    Frische/aktuell sichtbare Tracks bleiben unangetastet, auch
+    //    wenn dieser Frame sie nicht enthält.
+    tracked = tracked.filter(t => (now - t.lastSeenAt) < HOLD_MS);
+
+    // 5) Flach ausgeben (Reihenfolge = Reihenfolge in `tracked`).
+    const flat = [];
+    for (const t of tracked) for (const p of t.pts) flat.push(p);
+    return flat;
+  }
+
   let ws = null;
   let wsRetry = 0;
   function connectWS() {
@@ -370,8 +537,22 @@ INDEX_HTML = """<!doctype html>
     ws.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
-        points = Array.isArray(data.points) ? data.points : [];
-        draw();
+        const incoming = Array.isArray(data.points) ? data.points : [];
+        targetPoints = stabilizePoints(incoming);
+        // Wenn die Anzahl wächst (neues Viereck): die zusätzlichen
+        // Slots direkt am Ziel einrasten, damit sie nicht aus dem
+        // (0,0)-Default heran-animieren. Bestehende Slots laufen
+        // weiter über die Animationsschleife.
+        if (points.length < targetPoints.length) {
+          for (let i = points.length; i < targetPoints.length; i++) {
+            points.push(targetPoints[i].slice());
+          }
+          draw();
+        } else if (points.length > targetPoints.length) {
+          // Anzahl schrumpft: hinten überzählige verwerfen.
+          points.length = targetPoints.length;
+          draw();
+        }
       } catch (e) { /* ignore */ }
     };
     ws.onclose = () => { ws = null; scheduleReconnect(); };
@@ -386,6 +567,37 @@ INDEX_HTML = """<!doctype html>
   window.addEventListener('resize', resize);
   resize();
   connectWS();
+
+  // Render-/Animationsschleife: läuft konstant mit der Bildwiederholrate
+  // des Browsers und schiebt die aktuell gezeichneten Punkte stetig in
+  // Richtung der zuletzt empfangenen Zielpunkte. So bleibt die Projektion
+  // auch zwischen den (langsameren) WebSocket-Updates flüssig sichtbar.
+  function animate() {
+    if (targetPoints.length === points.length && points.length > 0) {
+      let changed = false;
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i], t = targetPoints[i];
+        const dx = t[0] - p[0], dy = t[1] - p[1];
+        const d = Math.hypot(dx, dy);
+        if (d <= ANIM_MIN_STEP) {
+          if (p[0] !== t[0] || p[1] !== t[1]) {
+            p[0] = t[0]; p[1] = t[1]; changed = true;
+          }
+          continue;
+        }
+        if (d > ANIM_SNAP_DIST) {
+          p[0] = t[0]; p[1] = t[1];
+        } else {
+          p[0] += dx * ANIM_ALPHA;
+          p[1] += dy * ANIM_ALPHA;
+        }
+        changed = true;
+      }
+      if (changed) draw();
+    }
+    requestAnimationFrame(animate);
+  }
+  requestAnimationFrame(animate);
 
   // Im Kiosk-Modus liegt der Tastatur-Fokus manchmal nicht auf dem Canvas,
   // wodurch C/R/Pfeiltasten ignoriert würden. Window/Canvas explizit fokussieren.
