@@ -1,13 +1,15 @@
 import base64
+import time
 import cv2
 import numpy as np
 from pathlib import Path
 
 _hand_detector = None
+_hand_detector_video = False
 
 
 def _get_hand_detector():
-    global _hand_detector
+    global _hand_detector, _hand_detector_video
     if _hand_detector is not None:
         return _hand_detector
     try:
@@ -20,8 +22,10 @@ def _get_hand_detector():
         opts = _mp_vision.HandLandmarkerOptions(
             base_options=_mp_python.BaseOptions(model_asset_path=str(model)),
             num_hands=2,
+            running_mode=_mp_vision.RunningMode.VIDEO,
         )
         _hand_detector = _mp_vision.HandLandmarker.create_from_options(opts)
+        _hand_detector_video = True
         return _hand_detector
     except Exception as exc:
         print(f"[vision] HandLandmarker nicht verfügbar: {exc}", file=__import__('sys').stderr)
@@ -29,32 +33,32 @@ def _get_hand_detector():
 
 
 def _compute_hovers(
-    frame_bgr: np.ndarray,
-    corners_4,
-    region_shape: tuple[int, int],
+    region_bgr: np.ndarray,
     contours_norm: list,
 ) -> list[bool]:
-    """Gibt pro Brett an, ob gerade eine Hand darüber erkannt wird."""
+    """Gibt pro Brett an, ob gerade eine Hand darueber erkannt wird.
+
+    Arbeitet direkt auf dem bereits gewarpten Region-Bild (deutlich kleiner
+    als das Vollbild) und nutzt MediaPipe im VIDEO-Modus mit internem
+    Tracking.
+    """
     hovers = [False] * len(contours_norm)
     detector = _get_hand_detector()
-    if detector is None or not contours_norm:
+    if detector is None or not contours_norm or region_bgr is None or region_bgr.size == 0:
         return hovers
 
     import mediapipe as mp
 
-    fh, fw = frame_bgr.shape[:2]
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    rh, rw = region_bgr.shape[:2]
+    rgb = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    result = detector.detect(mp_image)
+    if _hand_detector_video:
+        ts_ms = int(time.monotonic() * 1000)
+        result = detector.detect_for_video(mp_image, ts_ms)
+    else:
+        result = detector.detect(mp_image)
     if not result.hand_landmarks:
         return hovers
-
-    # Perspektivmatrix: Full-Frame-Pixel → Region-Pixel
-    centers = np.array([c[0].mean(axis=0) for c in corners_4], dtype=np.float32)
-    src = order_points(centers)
-    rh, rw = region_shape
-    dst = np.array([[0, 0], [rw - 1, 0], [rw - 1, rh - 1], [0, rh - 1]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(src, dst)
 
     # Brett-Quads in Region-Pixelkoordinaten
     nx = max(1, rw - 1)
@@ -64,21 +68,17 @@ def _compute_hovers(
         for quad in contours_norm
     ]
 
-    # Palmenmittelpunkt jeder erkannten Hand prüfen
-    # Landmarks 0 (Handwurzel) + 5,9,13,17 (MCP-Gelenke) = Handflächen-Zentrum
+    # Palmenmittelpunkt jeder erkannten Hand pruefen
+    # Landmarks 0 (Handwurzel) + 5,9,13,17 (MCP-Gelenke) = Handflaechen-Zentrum
     palm_indices = (0, 5, 9, 13, 17)
     for hand_lms in result.hand_landmarks:
         xs = [hand_lms[i].x for i in palm_indices]
         ys = [hand_lms[i].y for i in palm_indices]
-        hx = (sum(xs) / len(xs)) * fw
-        hy = (sum(ys) / len(ys)) * fh
-
-        pt = np.array([[[hx, hy]]], dtype=np.float32)
-        region_pt = cv2.perspectiveTransform(pt, M)[0][0]
-        rx, ry = float(region_pt[0]), float(region_pt[1])
+        rx = (sum(xs) / len(xs)) * rw
+        ry = (sum(ys) / len(ys)) * rh
 
         for qi, quad_px in enumerate(quads_px):
-            if not hovers[qi] and cv2.pointPolygonTest(quad_px, (rx, ry), False) >= 0:
+            if not hovers[qi] and cv2.pointPolygonTest(quad_px, (float(rx), float(ry)), False) >= 0:
                 hovers[qi] = True
 
     return hovers
@@ -110,6 +110,18 @@ DOT_MAX_AREA_FRAC = 0.05      # max. 5 % der Region (sonst kein „Punkt“)
 # Wird invalidiert, sobald sich die Frame-Auflösung ändert.
 _LAST_MARKERS: dict[int, np.ndarray] = {}
 _LAST_MARKERS_SHAPE: tuple[int, int] | None = None
+
+# ArUco-Detector ist teuer zu konstruieren -> einmalig cachen.
+_ARUCO_DETECTOR = None
+
+
+def _get_aruco_detector():
+    global _ARUCO_DETECTOR
+    if _ARUCO_DETECTOR is None:
+        aruco = cv2.aruco
+        aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+        _ARUCO_DETECTOR = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())
+    return _ARUCO_DETECTOR
 
 
 def to_bgr(img: np.ndarray) -> np.ndarray:
@@ -283,9 +295,7 @@ def process_frame(
         scale = MAX_DIM / max(h, w)
         frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-    aruco = cv2.aruco
-    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-    detector = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())
+    detector = _get_aruco_detector()
 
     gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray_full)
@@ -326,10 +336,9 @@ def process_frame(
     else:
         gray = to_intensity(frame, contour_channel)
 
-    blurred = cv2.GaussianBlur(gray, (1, 1), 0)
-    # Invertiert: Bretter (dunkel) -> weiß; nötig für RETR_EXTERNAL,
+    # Invertiert: Bretter (dunkel) -> weiss; noetig fuer RETR_EXTERNAL,
     # damit findContours die Bretter und nicht den Hintergrund verfolgt.
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     # Nur ÄUSSERE Konturen, sonst werden Innen- und Außenrand der Bretter
     # doppelt gefunden und die Eck-Erkennung springt zwischen beiden.
     raw_contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -432,24 +441,120 @@ def _open_webcam(index: int, width: int | None = None, height: int | None = None
     return cap
 
 
+# Wiederverwendete HTTP-Verbindung pro Ziel-Host, um TCP-Handshake-
+# Overhead in der Capture-Schleife zu vermeiden.
+_HTTP_CONN: dict[tuple[str, str, int], object] = {}
+
+
 def _post_points(points: list[list[float]], server_url: str,
                  errors: list[list[float] | None] | None = None,
                  hovers: list[bool] | None = None) -> None:
     import json
-    import urllib.request
+    from http.client import HTTPConnection, HTTPSConnection
+    from urllib.parse import urlsplit
+
     payload: dict = {"points": points}
     if errors is not None:
         payload["errors"] = errors
     if hovers is not None:
         payload["hovers"] = hovers
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        server_url.rstrip("/") + "/points",
-        data=body, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=2.0) as resp:
-        resp.read()
+
+    parts = urlsplit(server_url)
+    scheme = parts.scheme or "http"
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or (443 if scheme == "https" else 80)
+    base_path = parts.path.rstrip("/")
+    path = base_path + "/points"
+
+    key = (scheme, host, port)
+    conn = _HTTP_CONN.get(key)
+
+    def _new_conn():
+        if scheme == "https":
+            return HTTPSConnection(host, port, timeout=2.0)
+        return HTTPConnection(host, port, timeout=2.0)
+
+    headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+    for attempt in range(2):
+        if conn is None:
+            conn = _new_conn()
+            _HTTP_CONN[key] = conn
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            resp.read()
+            return
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _HTTP_CONN.pop(key, None)
+            conn = None
+            if attempt == 1:
+                raise
+
+
+def run_capture_loop(
+    on_result,
+    *,
+    camera: int = 0,
+    fps: float = 5.0,
+    width: int | None = None,
+    height: int | None = None,
+    rotate: int = 0,
+    contour_channel: str = "blue",
+    stop_event=None,
+) -> None:
+    """Webcam-Loop ohne HTTP/Preview - ruft ``on_result(points, errors, hovers)``
+    in-process auf. Geeignet, um direkt aus dem Server-Prozess zu laufen.
+
+    ``stop_event`` (threading.Event) bricht die Schleife sauber ab.
+    """
+    cap = _open_webcam(camera, width, height)
+    period = 1.0 / max(0.1, fps)
+    rot_code = {
+        90: cv2.ROTATE_90_CLOCKWISE,
+        180: cv2.ROTATE_180,
+        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    }.get(int(rotate) % 360)
+    print(f"[vision] Webcam {camera} geoeffnet (in-process, rotate={rotate}deg)")
+    last_send = 0.0
+    try:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                break
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                time.sleep(0.1)
+                continue
+            if rot_code is not None:
+                frame = cv2.rotate(frame, rot_code)
+            now = time.time()
+            if now - last_send < period:
+                time.sleep(max(0.0, period - (now - last_send)))
+                continue
+            last_send = now
+            try:
+                contours, errors, stages = process_frame(
+                    frame, return_stages=True, contour_channel=contour_channel,
+                )
+                flat = [[float(x), float(y)] for c in contours for x, y in c]
+                hovers: list[bool] = [False] * len(contours)
+                if stages.get("region") is not None and stages.get("corners") is not None:
+                    try:
+                        hovers = _compute_hovers(stages["region"], contours)
+                    except Exception as hover_exc:
+                        print(f"[vision] Hand-Hover: {hover_exc}", file=__import__('sys').stderr)
+                try:
+                    on_result(flat, errors, hovers)
+                except Exception as cb_exc:
+                    print(f"[vision] Callback-Fehler: {cb_exc}", file=__import__('sys').stderr)
+            except Exception as exc:
+                print(f"[vision] Fehler: {exc}", file=__import__('sys').stderr)
+    finally:
+        cap.release()
 
 
 def run_webcam(
@@ -509,10 +614,7 @@ def run_webcam(
                     hovers: list[bool] = [False] * len(contours)
                     if stages.get("region") is not None and stages.get("corners") is not None:
                         try:
-                            hovers = _compute_hovers(
-                                stages["frame"], stages["corners"],
-                                stages["region"].shape[:2], contours,
-                            )
+                            hovers = _compute_hovers(stages["region"], contours)
                         except Exception as hover_exc:
                             print(f"[vision] Hand-Hover: {hover_exc}", file=__import__('sys').stderr)
                     _post_points(flat, server_url, errors=errors, hovers=hovers)

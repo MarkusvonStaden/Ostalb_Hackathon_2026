@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import json
 import os
 import threading
 from datetime import datetime, timezone
@@ -36,8 +37,11 @@ _current_points: list[tuple[float, float]] = []
 _current_errors: list[list[float] | None] = []
 _current_hovers: list[bool] = []
 
-# WebSocket-Clients, die Punkt-Updates abonnieren.
-_ws_clients: set[WebSocket] = set()
+# WebSocket-Clients, die Punkt-Updates abonnieren. Pro Client gibt es eine
+# Queue mit ``maxsize=1``: liegt schon eine ungesendete Nachricht drin,
+# wird sie verworfen und durch die neueste ersetzt. Dadurch kann ein
+# langsamer Client den Broadcast nicht mehr ausbremsen.
+_ws_clients: dict[WebSocket, asyncio.Queue[str]] = {}
 _ws_lock = threading.Lock()
 _main_loop: asyncio.AbstractEventLoop | None = None
 
@@ -46,28 +50,121 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 async def _capture_loop() -> None:
     global _main_loop
     _main_loop = asyncio.get_running_loop()
+    _maybe_start_capture()
 
 
-async def _broadcast_points(points: list[tuple[float, float]],
-                            errors: list[list[float] | None] | None = None,
-                            hovers: list[bool] | None = None) -> None:
+@app.on_event("shutdown")
+async def _capture_shutdown() -> None:
+    _stop_capture()
+
+
+_capture_thread: threading.Thread | None = None
+_capture_stop = threading.Event()
+
+
+def _apply_points(points: list, errors: list | None, hovers: list | None) -> None:
+    """In-process update + broadcast. Wird aus dem Capture-Thread aufgerufen."""
+    global _current_points, _current_errors, _current_hovers
+    cleaned: list[tuple[float, float]] = [
+        (max(0.0, min(1.0, float(p[0]))), max(0.0, min(1.0, float(p[1])))) for p in points
+    ]
+    n_quads = len(cleaned) // 4
+    cleaned_errors: list[list[float] | None] = [None] * n_quads
+    if errors:
+        for i, e in enumerate(errors[:n_quads]):
+            if e is None:
+                continue
+            cleaned_errors[i] = [max(0.0, min(1.0, float(e[0]))), max(0.0, min(1.0, float(e[1])))]
+    cleaned_hovers: list[bool] = [False] * n_quads
+    if hovers:
+        for i, h in enumerate(hovers[:n_quads]):
+            cleaned_hovers[i] = bool(h)
+    _current_points = cleaned
+    _current_errors = cleaned_errors
+    _current_hovers = cleaned_hovers
+    loop = _main_loop
+    if loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(
+        _broadcast_points(cleaned, cleaned_errors, cleaned_hovers), loop,
+    )
+
+
+def _maybe_start_capture() -> None:
+    global _capture_thread
+    if _capture_thread is not None and _capture_thread.is_alive():
+        return
+    if os.environ.get("OSTALB_INPROC_CAPTURE", "1") == "0":
+        return
+    try:
+        from config import load_config
+        cfg = load_config()
+    except Exception as exc:
+        print(f"[server] Capture nicht gestartet: config-Fehler: {exc}")
+        return
+    cam = cfg.get("camera", {})
+    if not cam.get("enabled", True):
+        print("[server] Capture deaktiviert (config.camera.enabled = false)")
+        return
+
+    def _runner() -> None:
+        try:
+            from vision import run_capture_loop
+            run_capture_loop(
+                _apply_points,
+                camera=int(cam.get("index", 0)),
+                fps=float(cam.get("fps", 5)),
+                width=cam.get("width"),
+                height=cam.get("height"),
+                rotate=int(cam.get("rotate", 0)),
+                contour_channel=cam.get("contour_channel", "blue"),
+                stop_event=_capture_stop,
+            )
+        except Exception as exc:
+            print(f"[server] Capture-Loop beendet: {exc}")
+
+    _capture_stop.clear()
+    _capture_thread = threading.Thread(target=_runner, name="vision-capture", daemon=True)
+    _capture_thread.start()
+    print("[server] In-process Capture-Loop gestartet")
+
+
+def _stop_capture() -> None:
+    _capture_stop.set()
+    t = _capture_thread
+    if t is not None:
+        t.join(timeout=2.0)
+
+
+def _encode_msg(points: list[tuple[float, float]],
+                errors: list[list[float] | None] | None = None,
+                hovers: list[bool] | None = None) -> str:
     msg = {
         "points": [list(p) for p in points],
         "errors": [list(e) if e is not None else None for e in (errors or [])],
         "hovers": list(hovers) if hovers else [],
     }
+    return json.dumps(msg, separators=(",", ":"))
+
+
+async def _broadcast_points(points: list[tuple[float, float]],
+                            errors: list[list[float] | None] | None = None,
+                            hovers: list[bool] | None = None) -> None:
+    payload = _encode_msg(points, errors, hovers)
     with _ws_lock:
-        clients = list(_ws_clients)
-    dead: list[WebSocket] = []
-    for ws in clients:
+        queues = list(_ws_clients.values())
+    for q in queues:
+        # Drop-old: ist bereits etwas in der Queue, raus damit -
+        # der Client kriegt nur den neuesten Stand.
+        if q.full():
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
         try:
-            await ws.send_json(msg)
-        except Exception:
-            dead.append(ws)
-    if dead:
-        with _ws_lock:
-            for ws in dead:
-                _ws_clients.discard(ws)
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass
 
 
 def _schedule_broadcast(points: list[tuple[float, float]]) -> None:
@@ -1084,6 +1181,7 @@ INDEX_HTML = """<!doctype html>
     const dtFrame = Math.min(64, Math.max(1, ts - lastFrameTs));
     lastFrameTs = ts;
 
+    let changed = false;
     if (targetPoints.length === points.length && points.length > 0) {
       // Wie weit wir das Ziel anhand der letzten bekannten Geschwindigkeit
       // in die Zukunft schieben (deckt den ~200 ms Gap zwischen WS-Frames ab).
@@ -1092,7 +1190,6 @@ INDEX_HTML = """<!doctype html>
         : 0;
       // Frame-rate-unabhängiger Annäherungsfaktor.
       const alpha = 1 - Math.pow(0.5, dtFrame / ANIM_HALF_LIFE_MS);
-      let changed = false;
       for (let i = 0; i < points.length; i++) {
         const p = points[i], t = targetPoints[i];
         const v = velTargetPoints[i] || [0, 0];
@@ -1187,15 +1284,19 @@ async def set_points(payload: PointsPayload) -> dict:
 @app.websocket("/ws/points")
 async def ws_points(ws: WebSocket) -> None:
     await ws.accept()
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
     with _ws_lock:
-        _ws_clients.add(ws)
+        _ws_clients[ws] = queue
+
+    async def sender() -> None:
+        while True:
+            payload = await queue.get()
+            await ws.send_text(payload)
+
+    sender_task = asyncio.create_task(sender())
     try:
         # Aktuellen Stand sofort schicken.
-        await ws.send_json({
-            "points": [list(p) for p in _current_points],
-            "errors": [list(e) if e is not None else None for e in _current_errors],
-            "hovers": list(_current_hovers),
-        })
+        await ws.send_text(_encode_msg(_current_points, _current_errors, _current_hovers))
         while True:
             # Wir erwarten keine Nachrichten vom Client; receive blockiert,
             # bis die Verbindung geschlossen wird.
@@ -1205,8 +1306,13 @@ async def ws_points(ws: WebSocket) -> None:
     except Exception:
         pass
     finally:
+        sender_task.cancel()
+        try:
+            await sender_task
+        except (asyncio.CancelledError, Exception):
+            pass
         with _ws_lock:
-            _ws_clients.discard(ws)
+            _ws_clients.pop(ws, None)
 
 
 @app.post("/upload")
@@ -1263,34 +1369,6 @@ def _launch_kiosk_once(url: str) -> None:
     threading.Thread(target=_runner, name="kiosk-launcher", daemon=True).start()
 
 
-def _launch_webcam_once(camera_cfg: dict, server_url: str) -> None:
-    if os.environ.get("OSTALB_CAMERA_LAUNCHED") == "1":
-        return
-    os.environ["OSTALB_CAMERA_LAUNCHED"] = "1"
-
-    def _runner() -> None:
-        try:
-            from vision import run_webcam
-        except Exception as exc:  # pragma: no cover
-            print(f"[server] vision import failed: {exc}")
-            return
-        try:
-            run_webcam(
-                camera=int(camera_cfg.get("index", 0)),
-                server_url=server_url,
-                fps=float(camera_cfg.get("fps", 5.0)),
-                show=bool(camera_cfg.get("show_preview", False)),
-                width=camera_cfg.get("width"),
-                height=camera_cfg.get("height"),
-                rotate=int(camera_cfg.get("rotate", 0)),
-                contour_channel=str(camera_cfg.get("contour_channel", "blue")),
-            )
-        except Exception as exc:
-            print(f"[server] Webcam-Pipeline beendet: {exc}")
-
-    threading.Thread(target=_runner, name="webcam-pipeline", daemon=True).start()
-
-
 @app.on_event("startup")
 def _on_startup() -> None:
     from config import load_config
@@ -1299,5 +1377,3 @@ def _on_startup() -> None:
     print(f"[server] config: kamera={cfg['camera']}, server={cfg['server']}")
     if cfg["server"].get("kiosk", True):
         _launch_kiosk_once(url)
-    if cfg["camera"].get("enabled", True):
-        _launch_webcam_once(cfg["camera"], url)
