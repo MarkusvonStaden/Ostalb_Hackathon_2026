@@ -1,0 +1,16 @@
+{
+  "camera": {
+    "index": 1,
+    "width": 1280,
+    "height": 720,
+    "fps": 5,
+    "enabled": true,
+    "show_preview": true,
+    "rotate": 180,
+    "threshold": -1
+  },
+  "server": {
+    "url": "http://127.0.0.1:8000/",
+    "kiosk": true
+  }
+}

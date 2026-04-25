@@ -1,5 +1,7 @@
 import base64
 import binascii
+import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -51,12 +53,12 @@ INDEX_HTML = """<!doctype html>
     }
     canvas {
       display: block;
-      width: 1001vw;
+      width: 100vw;
       height: 100vh;
     }
     #help {
       position: fixed;
-      top: 8px;1
+      top: 8px;
       left: 8px;
       padding: 6px 10px;
       background: rgba(0,0,0,0.55);
@@ -311,7 +313,7 @@ INDEX_HTML = """<!doctype html>
   window.addEventListener('resize', resize);
   resize();
   poll();
-  setInterval(poll, 3000);
+  setInterval(poll, 1000);
 
   // Im Kiosk-Modus liegt der Tastatur-Fokus manchmal nicht auf dem Canvas,
   // wodurch C/R/Pfeiltasten ignoriert würden. Window/Canvas explizit fokussieren.
@@ -378,3 +380,69 @@ def latest():
 def list_images():
     files = sorted(p.name for p in UPLOAD_DIR.glob("*.jpg") if p.name != "latest.jpg")
     return {"count": len(files), "files": files}
+
+
+# --- Browser im Kiosk-Modus automatisch öffnen ---------------------------
+# Mehrfache Aufrufe werden durch einen Marker (Env-Var) verhindert; das ist
+# wichtig bei `uvicorn --reload`, wo das Modul mehrfach importiert wird.
+def _launch_kiosk_once(url: str) -> None:
+    if os.environ.get("OSTALB_KIOSK_LAUNCHED") == "1":
+        return
+    os.environ["OSTALB_KIOSK_LAUNCHED"] = "1"
+
+    def _runner() -> None:
+        try:
+            from projector import _open_browser, _wait_for_server
+        except Exception as exc:  # pragma: no cover
+            print(f"[server] projector import failed: {exc}")
+            return
+        if _wait_for_server(url, timeout=15.0):
+            _open_browser(url)
+        else:
+            print(f"[server] Kiosk: Server unter {url} nicht erreichbar.")
+
+    threading.Thread(target=_runner, name="kiosk-launcher", daemon=True).start()
+
+
+def _launch_webcam_once(camera_cfg: dict, server_url: str) -> None:
+    if os.environ.get("OSTALB_CAMERA_LAUNCHED") == "1":
+        return
+    os.environ["OSTALB_CAMERA_LAUNCHED"] = "1"
+
+    def _runner() -> None:
+        try:
+            from vision import run_webcam
+        except Exception as exc:  # pragma: no cover
+            print(f"[server] vision import failed: {exc}")
+            return
+        try:
+            run_webcam(
+                camera=int(camera_cfg.get("index", 0)),
+                server_url=server_url,
+                fps=float(camera_cfg.get("fps", 5.0)),
+                show=bool(camera_cfg.get("show_preview", False)),
+                width=camera_cfg.get("width"),
+                height=camera_cfg.get("height"),
+                rotate=int(camera_cfg.get("rotate", 0)),
+                threshold=(
+                    None if camera_cfg.get("threshold", -1) is None
+                    or int(camera_cfg.get("threshold", -1)) < 0
+                    else int(camera_cfg.get("threshold"))
+                ),
+            )
+        except Exception as exc:
+            print(f"[server] Webcam-Pipeline beendet: {exc}")
+
+    threading.Thread(target=_runner, name="webcam-pipeline", daemon=True).start()
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    from config import load_config
+    cfg = load_config()
+    url = cfg["server"]["url"]
+    print(f"[server] config: kamera={cfg['camera']}, server={cfg['server']}")
+    if cfg["server"].get("kiosk", True):
+        _launch_kiosk_once(url)
+    if cfg["camera"].get("enabled", True):
+        _launch_webcam_once(cfg["camera"], url)
