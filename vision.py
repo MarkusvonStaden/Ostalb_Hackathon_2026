@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 
 PANEL_H = 540          # unified panel height; width scales with aspect ratio
-REGION_ASPECT = 75 / 50  # width / height of the known region between markers
+REGION_ASPECT = 80 / 50  # width / height of the known region between markers
 REGION_THUMB_H = 320
 MAX_DIM = 1280         # longest edge cap before processing
 MAX_DISPLAY_W = 1800   # max breite des kombinierten Vorschau-Fensters in px
