@@ -1,0 +1,1 @@
+Funktion "handle_image" returns list of lists
