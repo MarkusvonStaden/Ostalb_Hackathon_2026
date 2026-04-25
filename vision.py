@@ -1,6 +1,87 @@
 import base64
 import cv2
 import numpy as np
+from pathlib import Path
+
+_hand_detector = None
+
+
+def _get_hand_detector():
+    global _hand_detector
+    if _hand_detector is not None:
+        return _hand_detector
+    try:
+        import mediapipe as mp
+        from mediapipe.tasks import python as _mp_python
+        from mediapipe.tasks.python import vision as _mp_vision
+        model = Path(__file__).parent / 'hand_landmarker.task'
+        if not model.exists():
+            return None
+        opts = _mp_vision.HandLandmarkerOptions(
+            base_options=_mp_python.BaseOptions(model_asset_path=str(model)),
+            num_hands=2,
+        )
+        _hand_detector = _mp_vision.HandLandmarker.create_from_options(opts)
+        return _hand_detector
+    except Exception as exc:
+        print(f"[vision] HandLandmarker nicht verfügbar: {exc}", file=__import__('sys').stderr)
+        return None
+
+
+def _compute_hovers(
+    frame_bgr: np.ndarray,
+    corners_4,
+    region_shape: tuple[int, int],
+    contours_norm: list,
+) -> list[bool]:
+    """Gibt pro Brett an, ob gerade eine Hand darüber erkannt wird."""
+    hovers = [False] * len(contours_norm)
+    detector = _get_hand_detector()
+    if detector is None or not contours_norm:
+        return hovers
+
+    import mediapipe as mp
+
+    fh, fw = frame_bgr.shape[:2]
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = detector.detect(mp_image)
+    if not result.hand_landmarks:
+        return hovers
+
+    # Perspektivmatrix: Full-Frame-Pixel → Region-Pixel
+    centers = np.array([c[0].mean(axis=0) for c in corners_4], dtype=np.float32)
+    src = order_points(centers)
+    rh, rw = region_shape
+    dst = np.array([[0, 0], [rw - 1, 0], [rw - 1, rh - 1], [0, rh - 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src, dst)
+
+    # Brett-Quads in Region-Pixelkoordinaten
+    nx = max(1, rw - 1)
+    ny = max(1, rh - 1)
+    quads_px = [
+        np.array([[int(x * nx), int(y * ny)] for x, y in quad], dtype=np.int32)
+        for quad in contours_norm
+    ]
+
+    # Palmenmittelpunkt jeder erkannten Hand prüfen
+    # Landmarks 0 (Handwurzel) + 5,9,13,17 (MCP-Gelenke) = Handflächen-Zentrum
+    palm_indices = (0, 5, 9, 13, 17)
+    for hand_lms in result.hand_landmarks:
+        xs = [hand_lms[i].x for i in palm_indices]
+        ys = [hand_lms[i].y for i in palm_indices]
+        hx = (sum(xs) / len(xs)) * fw
+        hy = (sum(ys) / len(ys)) * fh
+
+        pt = np.array([[[hx, hy]]], dtype=np.float32)
+        region_pt = cv2.perspectiveTransform(pt, M)[0][0]
+        rx, ry = float(region_pt[0]), float(region_pt[1])
+
+        for qi, quad_px in enumerate(quads_px):
+            if not hovers[qi] and cv2.pointPolygonTest(quad_px, (rx, ry), False) >= 0:
+                hovers[qi] = True
+
+    return hovers
 
 PANEL_H = 540          # unified panel height; width scales with aspect ratio
 REGION_ASPECT = 87 / 47  # width / height of the known region between markers
@@ -352,12 +433,15 @@ def _open_webcam(index: int, width: int | None = None, height: int | None = None
 
 
 def _post_points(points: list[list[float]], server_url: str,
-                 errors: list[list[float] | None] | None = None) -> None:
+                 errors: list[list[float] | None] | None = None,
+                 hovers: list[bool] | None = None) -> None:
     import json
     import urllib.request
     payload: dict = {"points": points}
     if errors is not None:
         payload["errors"] = errors
+    if hovers is not None:
+        payload["hovers"] = hovers
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         server_url.rstrip("/") + "/points",
@@ -414,17 +498,24 @@ def run_webcam(
             if now - last_send >= period:
                 last_send = now
                 try:
+                    contours, errors, stages = process_frame(frame, return_stages=True, contour_channel=contour_channel)  # type: ignore[misc]
                     if show:
-                        contours, errors, stages = process_frame(frame, return_stages=True, contour_channel=contour_channel)
                         last_panel = build_display(
                             stages["frame"], stages["gray"], stages["thresh"],
                             stages["contour_img"], stages["corners"], stages["ids"],
                             stages["region"], stages.get("contour_channel", contour_channel),
                         )
-                    else:
-                        contours, errors = process_frame(frame, contour_channel=contour_channel)
                     flat = [[float(x), float(y)] for c in contours for x, y in c]
-                    _post_points(flat, server_url, errors=errors)
+                    hovers: list[bool] = [False] * len(contours)
+                    if stages.get("region") is not None and stages.get("corners") is not None:
+                        try:
+                            hovers = _compute_hovers(
+                                stages["frame"], stages["corners"],
+                                stages["region"].shape[:2], contours,
+                            )
+                        except Exception as hover_exc:
+                            print(f"[vision] Hand-Hover: {hover_exc}", file=__import__('sys').stderr)
+                    _post_points(flat, server_url, errors=errors, hovers=hovers)
                     if show is False:
                         n_err = sum(1 for e in errors if e is not None)
                         print(f"[vision] {len(contours)} Vierecke -> {len(flat)} Punkte, {n_err} Fehler-Markierung(en)")
