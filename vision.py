@@ -13,6 +13,23 @@ MAX_DISPLAY_H = 4320   # max höhe des kombinierten Vorschau-Fensters in px
 CONTOUR_MIN_LEN = 0.06  # min arc length as fraction of region perimeter (2 * (w + h))
 CONTOUR_MAX_LEN = 0.80  # max arc length as fraction of region perimeter
 
+# Blauer Fehler-Punkt auf dem Brett: bewusst weiter HSV-Bereich, damit kein
+# Alarm verpasst wird. Hue in OpenCV: 0..179. Blau-Klebepunkte liegen meist
+# bei H≈100..115; wir akzeptieren H 95..135 (deckt auch leichten Cyan-/
+# Lila-Drift ab). Sättigung muss merklich vorhanden sein, sonst werden
+# graue Bretter / Schatten getriggert.
+DOT_HSV_LOWER = (95, 80, 50)
+DOT_HSV_UPPER = (135, 255, 255)
+DOT_MIN_AREA_PX = 30          # kleinere Blobs werden als Rauschen verworfen
+DOT_MAX_AREA_FRAC = 0.05      # max. 5 % der Region (sonst kein „Punkt“)
+
+# Cache der zuletzt gesehenen ArUco-Marker pro ID. Wird genutzt, wenn im
+# aktuellen Frame nicht alle 4 Marker erkannt werden – dann fallen wir auf
+# die letzte bekannte Position zurück, statt die Region komplett zu verlieren.
+# Wird invalidiert, sobald sich die Frame-Auflösung ändert.
+_LAST_MARKERS: dict[int, np.ndarray] = {}
+_LAST_MARKERS_SHAPE: tuple[int, int] | None = None
+
 
 def to_bgr(img: np.ndarray) -> np.ndarray:
     if img.ndim == 2:
@@ -57,6 +74,39 @@ def label(img: np.ndarray, text: str) -> np.ndarray:
     cv2.putText(out, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     return out
 
+
+
+def detect_blue_dots(region_bgr: np.ndarray) -> tuple[list[tuple[float, float, float]], np.ndarray]:
+    """Suche blaue Klebepunkte in der gewarpten Region.
+
+    Liefert eine Liste ``[(x_norm, y_norm, area_px), ...]`` mit den
+    Schwerpunkten in normalisierten Region-Koordinaten (0..1) sowie die
+    binäre HSV-Maske (für Visualisierung).
+    """
+    if region_bgr is None or region_bgr.size == 0:
+        return [], np.zeros((1, 1), dtype=np.uint8)
+    h, w = region_bgr.shape[:2]
+    hsv = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(DOT_HSV_LOWER, dtype=np.uint8),
+                       np.array(DOT_HSV_UPPER, dtype=np.uint8))
+    # Rauschen wegputzen, dann Lücken schließen.
+    kernel3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel5)
+
+    max_area = DOT_MAX_AREA_FRAC * float(w * h)
+    nx = max(1, w - 1)
+    ny = max(1, h - 1)
+    n_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    dots: list[tuple[float, float, float]] = []
+    for i in range(1, n_labels):  # 0 = Hintergrund
+        area = float(stats[i, cv2.CC_STAT_AREA])
+        if area < DOT_MIN_AREA_PX or area > max_area:
+            continue
+        cx, cy = centroids[i]
+        dots.append((round(float(cx) / nx, 4), round(float(cy) / ny, 4), area))
+    return dots, mask
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -159,6 +209,33 @@ def process_frame(
     gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray_full)
 
+    # Marker-Cache aktualisieren / bei Auflösungswechsel verwerfen.
+    global _LAST_MARKERS, _LAST_MARKERS_SHAPE
+    cur_shape = (frame.shape[0], frame.shape[1])
+    if _LAST_MARKERS_SHAPE != cur_shape:
+        _LAST_MARKERS.clear()
+        _LAST_MARKERS_SHAPE = cur_shape
+    if ids is not None and len(ids) > 0:
+        for c, i in zip(corners, ids.flatten()):
+            _LAST_MARKERS[int(i)] = c.copy()
+
+    # Falls weniger als 4 Marker im aktuellen Frame: mit zwischengespeicherten
+    # Positionen auffüllen, damit die Region-Extraktion stabil bleibt.
+    cur_ids = set(int(i) for i in (ids.flatten() if ids is not None else []))
+    if len(cur_ids) < 4 and len(_LAST_MARKERS) >= 4:
+        merged_corners = list(corners) if corners is not None else []
+        merged_ids = list(cur_ids)
+        for mid, mcorner in _LAST_MARKERS.items():
+            if mid in cur_ids:
+                continue
+            merged_corners.append(mcorner)
+            merged_ids.append(mid)
+            if len(merged_ids) == 4:
+                break
+        if len(merged_ids) == 4:
+            corners = tuple(merged_corners)
+            ids = np.array(merged_ids, dtype=np.int32).reshape(-1, 1)
+
     region = None
     if ids is not None and len(ids) == 4:
         region = extract_between_tags(frame, corners)
@@ -198,8 +275,28 @@ def process_frame(
         normalized = [[round(float(x) / nx, 4), round(float(y) / ny, 4)] for x, y in quad]
         result.append(normalized)
 
+    # Blaue Fehler-Punkte nur in der gewarpten Region suchen (außerhalb
+    # gibt es keine sinnvolle Bezugsfläche). Pro Brett-Quad max. einen
+    # Treffer (größte Fläche gewinnt).
+    errors: list[list[float] | None] = [None] * len(result)
+    dot_mask = np.zeros((h, w), dtype=np.uint8)
+    dots: list[tuple[float, float, float]] = []
+    if region is not None and quads_px:
+        dots, dot_mask = detect_blue_dots(region)
+        # Sortiere nach Fläche absteigend, damit der größte Punkt pro
+        # Brett gewinnt.
+        for dx, dy, area in sorted(dots, key=lambda d: d[2], reverse=True):
+            px = dx * nx
+            py = dy * ny
+            for qi, quad_px in enumerate(quads_px):
+                if errors[qi] is not None:
+                    continue
+                if cv2.pointPolygonTest(quad_px, (float(px), float(py)), False) >= 0:
+                    errors[qi] = [round(dx, 4), round(dy, 4)]
+                    break
+
     if not return_stages:
-        return result
+        return result, errors
 
     # Konturen-Visualisierung (auf der Region bzw. dem Vollbild zeichnen).
     base = region if region is not None else frame
@@ -209,6 +306,12 @@ def process_frame(
         cv2.polylines(contour_img, [quad], True, (0, 0, 255), 2)
         for p in quad:
             cv2.circle(contour_img, tuple(int(v) for v in p), 5, (0, 0, 255), -1)
+    # Blaue Punkte einzeichnen (in der Region-Visualisierung).
+    for dx, dy, _area in dots:
+        cx = int(round(dx * nx))
+        cy = int(round(dy * ny))
+        cv2.circle(contour_img, (cx, cy), 10, (0, 165, 255), 2, lineType=cv2.LINE_AA)
+        cv2.circle(contour_img, (cx, cy), 3, (0, 165, 255), -1, lineType=cv2.LINE_AA)
 
     stages = {
         "frame": frame,
@@ -219,8 +322,10 @@ def process_frame(
         "ids": ids,
         "region": region,
         "contour_channel": contour_channel,
+        "errors": errors,
+        "dot_mask": dot_mask,
     }
-    return result, stages
+    return result, errors, stages
 
 
 def process_image(image_b64: str) -> list[list[list[float]]]:
@@ -228,7 +333,8 @@ def process_image(image_b64: str) -> list[list[list[float]]]:
     frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
         raise ValueError("Could not decode base64 image")
-    return process_frame(frame)
+    contours, _errors = process_frame(frame)
+    return contours
 
 
 def _open_webcam(index: int, width: int | None = None, height: int | None = None) -> cv2.VideoCapture:
@@ -245,10 +351,14 @@ def _open_webcam(index: int, width: int | None = None, height: int | None = None
     return cap
 
 
-def _post_points(points: list[list[float]], server_url: str) -> None:
+def _post_points(points: list[list[float]], server_url: str,
+                 errors: list[list[float] | None] | None = None) -> None:
     import json
     import urllib.request
-    body = json.dumps({"points": points}).encode("utf-8")
+    payload: dict = {"points": points}
+    if errors is not None:
+        payload["errors"] = errors
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         server_url.rstrip("/") + "/points",
         data=body, method="POST",
@@ -282,8 +392,10 @@ def run_webcam(
     print(f"[vision] Webcam {camera} geöffnet – sende an {server_url} (rotate={rotate}°, Strg+C zum Beenden)")
 
     win_name = "vision (stages: original | region | gray | threshold | contours)"
+    raw_win_name = "camera (raw)"
     if show:
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(raw_win_name, cv2.WINDOW_NORMAL)
 
     import time
     last_send = 0.0
@@ -303,18 +415,19 @@ def run_webcam(
                 last_send = now
                 try:
                     if show:
-                        contours, stages = process_frame(frame, return_stages=True, contour_channel=contour_channel)
+                        contours, errors, stages = process_frame(frame, return_stages=True, contour_channel=contour_channel)
                         last_panel = build_display(
                             stages["frame"], stages["gray"], stages["thresh"],
                             stages["contour_img"], stages["corners"], stages["ids"],
                             stages["region"], stages.get("contour_channel", contour_channel),
                         )
                     else:
-                        contours = process_frame(frame, contour_channel=contour_channel)
+                        contours, errors = process_frame(frame, contour_channel=contour_channel)
                     flat = [[float(x), float(y)] for c in contours for x, y in c]
-                    _post_points(flat, server_url)
+                    _post_points(flat, server_url, errors=errors)
                     if show is False:
-                        print(f"[vision] {len(contours)} Vierecke -> {len(flat)} Punkte")
+                        n_err = sum(1 for e in errors if e is not None)
+                        print(f"[vision] {len(contours)} Vierecke -> {len(flat)} Punkte, {n_err} Fehler-Markierung(en)")
                 except Exception as exc:
                     print(f"[vision] Fehler: {exc}", file=__import__('sys').stderr)
 
@@ -325,6 +438,7 @@ def run_webcam(
                 if scale < 1.0:
                     img = cv2.resize(img, (int(pw * scale), int(ph * scale)), interpolation=cv2.INTER_AREA)
                 cv2.imshow(win_name, img)
+                cv2.imshow(raw_win_name, frame)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
                     break
             else:
@@ -365,8 +479,9 @@ def main() -> None:
     frame = cv2.imread(args.image)
     if frame is None:
         raise SystemExit(f"Konnte Bild nicht laden: {args.image}")
-    contours, stages = process_frame(frame, return_stages=True, contour_channel=args.contour_channel)
-    print(contours)
+    contours, errors, stages = process_frame(frame, return_stages=True, contour_channel=args.contour_channel)
+    print("contours:", contours)
+    print("errors:  ", errors)
     display = build_display(
         stages["frame"], stages["gray"], stages["thresh"],
         stages["contour_img"], stages["corners"], stages["ids"],

@@ -23,10 +23,15 @@ class ImagePayload(BaseModel):
 class PointsPayload(BaseModel):
     # Liste von [x, y] mit Werten zwischen 0 und 1.
     points: list[tuple[float, float]]
+    # Optional: pro Brett (= je 4 aufeinanderfolgende Punkte) entweder ein
+    # [x, y]-Punkt der Fehlerstelle in normalisierten Region-Koordinaten
+    # oder ``None``. Länge muss ``len(points) // 4`` sein.
+    errors: list[list[float] | None] | None = None
 
 
 # Aktuell zu projizierende Punkte (normalisiert, 0..1).
 _current_points: list[tuple[float, float]] = []
+_current_errors: list[list[float] | None] = []
 
 # WebSocket-Clients, die Punkt-Updates abonnieren.
 _ws_clients: set[WebSocket] = set()
@@ -40,8 +45,12 @@ async def _capture_loop() -> None:
     _main_loop = asyncio.get_running_loop()
 
 
-async def _broadcast_points(points: list[tuple[float, float]]) -> None:
-    msg = {"points": [list(p) for p in points]}
+async def _broadcast_points(points: list[tuple[float, float]],
+                            errors: list[list[float] | None] | None = None) -> None:
+    msg = {
+        "points": [list(p) for p in points],
+        "errors": [list(e) if e is not None else None for e in (errors or [])],
+    }
     with _ws_lock:
         clients = list(_ws_clients)
     dead: list[WebSocket] = []
@@ -68,6 +77,7 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <title>Ostalb-Hack Projector</title>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
   <style>
     html, body {
       margin: 0;
@@ -126,9 +136,17 @@ INDEX_HTML = """<!doctype html>
   const REGION_W_MM = 870;
   const REGION_H_MM = 470;
 
+  // Fixe physische Größe des projizierten Etiketts pro Brett (in mm).
+  // Bleibt unabhängig von Brett-Größe und Bildschirm-Skalierung gleich.
+  const LABEL_W_MM = 150;
+  const LABEL_H_MM = 90;
+  const LABEL_MARGIN_MM = 10;  // Innenabstand TL-Brettkante → TL-Label
+
   const canvas = document.getElementById('stage');
   const ctx = canvas.getContext('2d');
   let points = [];
+  // Pro Brett (= je 4 Punkte in `points`) entweder [x,y] oder null.
+  let errors = [];
   let cssW = 0, cssH = 0;
 
   // Kalibrierung: vier Ecken in normalisierten Canvas-Koordinaten (0..1).
@@ -189,6 +207,267 @@ INDEX_HTML = """<!doctype html>
             (H[3]*u + H[4]*v + H[5]) / w];
   }
 
+  // Per-Slot-Hysterese: speichert die zuletzt gewählte TL-Ecke pro
+  // Tracker-Slot, damit das Label bei leichtem Wackeln nicht zwischen
+  // zwei Ecken springt.
+  const _labelOrientMemo = new Map();   // slotIdx -> { tlIdx, topIdx }
+
+  // Liefert die vier Label-Eckpunkte (in normalisierten 0..1 Koordinaten)
+  // für ein Brett-Viereck. Label sitzt mittig auf dem Brett und ist an der
+  // Brettkante ausgerichtet. Konstante Größe in mm.
+  function labelFrameForQuad(quadN, quadP, slotIdx) {
+    // Kandidat: Brett-Eckpunkt mit kleinstem (x+y) in mm.
+    let tlIdx = 0, tlMin = Infinity;
+    const scores = [];
+    for (let i = 0; i < 4; i++) {
+      const s = quadN[i][0] * REGION_W_MM + quadN[i][1] * REGION_H_MM;
+      scores.push(s);
+      if (s < tlMin) { tlMin = s; tlIdx = i; }
+    }
+    // Hysterese: Wenn ein vorheriger TL-Slot existiert und der dortige
+    // Score nur knapp größer ist als das aktuelle Minimum, behalte den
+    // alten Index. Verhindert Springen zwischen zwei fast gleich
+    // bewerteten Ecken.
+    const prevMemo = _labelOrientMemo.get(slotIdx);
+    if (prevMemo) {
+      const prevScore = scores[prevMemo.tlIdx];
+      // 30 mm-Hysterese (etwa eine halbe Label-Höhe).
+      if (prevScore - tlMin < 30) tlIdx = prevMemo.tlIdx;
+    }
+
+    const prevIdx = (tlIdx + 3) % 4;
+    const nextIdx = (tlIdx + 1) % 4;
+    // "Oben"-Nachbar: derjenige mit kleinerem |Δy| in Bildschirm-Pixeln.
+    const dyPrev = Math.abs(quadP[prevIdx][1] - quadP[tlIdx][1]);
+    const dyNext = Math.abs(quadP[nextIdx][1] - quadP[tlIdx][1]);
+    let topIdx = dyNext <= dyPrev ? nextIdx : prevIdx;
+    if (prevMemo && prevMemo.tlIdx === tlIdx) {
+      // Prüfen, ob der bisherige top-Nachbar noch passt (gleiche Relation).
+      // Hysterese: nur wechseln, wenn der andere Nachbar deutlich besser ist.
+      const prevTopOk = (prevMemo.topIdx === prevIdx || prevMemo.topIdx === nextIdx);
+      if (prevTopOk) {
+        const dyKept = prevMemo.topIdx === prevIdx ? dyPrev : dyNext;
+        const dyOther = prevMemo.topIdx === prevIdx ? dyNext : dyPrev;
+        // 25 % Vorteil für den bisherigen erforderlich, um zu wechseln.
+        if (dyKept <= dyOther * 1.25) topIdx = prevMemo.topIdx;
+      }
+    }
+    const downIdx = topIdx === nextIdx ? prevIdx : nextIdx;
+    _labelOrientMemo.set(slotIdx, { tlIdx, topIdx });
+
+    const tlMm = [quadN[tlIdx][0] * REGION_W_MM, quadN[tlIdx][1] * REGION_H_MM];
+    const topV = [quadN[topIdx][0] * REGION_W_MM - tlMm[0],
+                  quadN[topIdx][1] * REGION_H_MM - tlMm[1]];
+    const downV = [quadN[downIdx][0] * REGION_W_MM - tlMm[0],
+                   quadN[downIdx][1] * REGION_H_MM - tlMm[1]];
+    const topLen = Math.hypot(topV[0], topV[1]) || 1;
+    const downLen = Math.hypot(downV[0], downV[1]) || 1;
+    const topU = [topV[0] / topLen, topV[1] / topLen];
+    const downU = [downV[0] / downLen, downV[1] / downLen];
+
+    // Label sitzt in der TL-Ecke des Bretts (mit kleinem Innenabstand),
+    // statt zentriert.
+    const x0 = LABEL_MARGIN_MM;
+    const y0 = LABEL_MARGIN_MM;
+
+    function mkPt(a, b) {
+      const mmX = tlMm[0] + a * topU[0] + b * downU[0];
+      const mmY = tlMm[1] + a * topU[1] + b * downU[1];
+      return [mmX / REGION_W_MM, mmY / REGION_H_MM];
+    }
+    return [
+      mkPt(x0,              y0),
+      mkPt(x0 + LABEL_W_MM, y0),
+      mkPt(x0 + LABEL_W_MM, y0 + LABEL_H_MM),
+      mkPt(x0,              y0 + LABEL_H_MM),
+    ];
+  }
+
+  // Deterministische Pseudo-Zufallszahl 0..1 aus Integer-Seed.
+  function _rand(seed) {
+    let s = (seed | 0) * 1103515245 + 12345;
+    s = (s ^ (s >>> 16)) >>> 0;
+    return ((s * 2654435761) >>> 0) / 4294967296;
+  }
+  function _pad(n, w) {
+    let s = String(Math.floor(n));
+    while (s.length < w) s = '0' + s;
+    return s;
+  }
+
+  // Pro Brett-Index unterschiedliche, aber stabile Demo-Daten.
+  function labelDataFor(idx, wMm, hMm) {
+    const matNames = ['Front 11', 'Front 12', 'T\u00fcr 09', 'Seite 04', 'Boden 02', 'Front 14'];
+    const oCodes  = ['O 45/93',  'O 90/93',  'O 60/93',  'O 30/93',  'O 75/93',  'O 90/45'];
+    const koCodes = ['PLT', 'STD', 'KMP', 'PLT'];
+    const apl     = ['L3&', 'L4&', 'M2&', 'L3&', 'R1&'];
+    const farben  = [126, 273, 412, 126, 305, 188];
+    const fa1 = farben[idx % farben.length];
+    const fa2 = farben[(idx + 2) % farben.length];
+    const fugen = farben[(idx + 1) % farben.length];
+    return {
+      gv:    2247900 + ((idx * 17) % 200),
+      pos:   _pad(240 + idx * 10, 4),
+      auid:  9559180 + ((idx * 23) % 500),
+      auid2: _pad(10 + idx * 10, 4),
+      matNo: 1 + ((idx * 3) % 9),
+      mat:   matNames[idx % matNames.length],
+      gr:    760 + ((idx * 4) % 40),
+      fa0:   _pad((idx * 11) % 1000, 3),
+      fa1, fa2,
+      pr:    _pad(12 + (idx * 3) % 90, 3),
+      bn:    'BN',
+      o:     oCodes[idx % oCodes.length],
+      blAn:  'B',
+      tan:   'B',
+      eg:    '',
+      ko:    koCodes[idx % koCodes.length],
+      apl:   apl[idx % apl.length],
+      afolge: 1 + (idx % 9),
+      za1:   _pad(18 + (idx % 6), 2),
+      za2:   _pad(1 + (idx % 9), 1),
+      za3:   _pad(2 + (idx % 9), 2),
+      kantNo: _pad(1 + idx, 4),
+      kantId: '202604' + _pad(15 + (idx % 28), 2),
+      fugen,
+      thick: (15 + (idx % 9)).toFixed(1).replace('.', ','),
+      qty1:  '1,00',
+      qty2:  '2,00',
+      qty3:  (0.30 + (idx % 10) * 0.07).toFixed(2).replace('.', ','),
+      art1Code: _pad(444618900000 + idx * 1000, 12),
+      art2Code: _pad(128300000000 + idx * 137, 12),
+      art3Code: _pad(279082730000 + idx * 271, 12),
+      sumA:  _pad(80 + (idx * 13) % 200, 2) + ' ' + _pad((idx * 31) % 1000, 3),
+      sumB:  '0,0',
+      week:  '24.04.2026',
+    };
+  }
+
+  function _fmtMm(v) {
+    return v.toFixed(1).replace('.', ',');
+  }
+
+  // QR-Modul-Cache: pro Inhalt nur einmal codieren.
+  const _qrCache = new Map();
+  function getQrModules(text) {
+    if (_qrCache.has(text)) return _qrCache.get(text);
+    if (typeof qrcode !== 'function') return null;
+    try {
+      const qr = qrcode(0, 'M');   // typeNumber=0 = automatisch, ECC = M
+      qr.addData(text);
+      qr.make();
+      const n = qr.getModuleCount();
+      const mods = new Array(n);
+      for (let r = 0; r < n; r++) {
+        mods[r] = new Array(n);
+        for (let c = 0; c < n; c++) mods[r][c] = qr.isDark(r, c);
+      }
+      const result = { n, mods };
+      _qrCache.set(text, result);
+      return result;
+    } catch (e) {
+      return null;
+    }
+  }
+  function drawQr(text, x, y, size, fg, bg) {
+    const data = getQrModules(text);
+    if (!data) return;
+    if (bg) {
+      ctx.fillStyle = bg;
+      ctx.fillRect(x, y, size, size);
+    }
+    const cell = size / data.n;
+    ctx.fillStyle = fg;
+    for (let r = 0; r < data.n; r++) {
+      for (let c = 0; c < data.n; c++) {
+        if (data.mods[r][c]) {
+          ctx.fillRect(x + c * cell, y + r * cell, cell + 0.5, cell + 0.5);
+        }
+      }
+    }
+  }
+
+  function drawLabel(quadN, quadP, quadIdx) {
+    const cornersN = labelFrameForQuad(quadN, quadP, quadIdx);
+    const cornersP = cornersN.map(p => applyH(p[0], p[1]));
+    const [P0, P1, P2, P3] = cornersP;
+    const W = Math.hypot(P1[0] - P0[0], P1[1] - P0[1]);
+    const H = Math.hypot(P3[0] - P0[0], P3[1] - P0[1]);
+    if (W < 12 || H < 8) return;
+
+    let angle = Math.atan2(P1[1] - P0[1], P1[0] - P0[0]);
+    let originX = P0[0], originY = P0[1];
+    if (angle > Math.PI / 2 || angle < -Math.PI / 2) {
+      angle = angle > 0 ? angle - Math.PI : angle + Math.PI;
+      originX = P2[0]; originY = P2[1];
+    }
+
+    // Live-Maße: längste Kante = Breite, kürzeste = Höhe.
+    const edges = [];
+    for (let j = 0; j < 4; j++) {
+      const k = (j + 1) % 4;
+      const dxN = (quadN[k][0] - quadN[j][0]) * REGION_W_MM;
+      const dyN = (quadN[k][1] - quadN[j][1]) * REGION_H_MM;
+      edges.push(Math.hypot(dxN, dyN));
+    }
+    const wMm = Math.max(...edges);
+    const hMm = Math.min(...edges);
+
+    // Brett-Identifikation über die Maße: 170×400 (klein) vs. 365×400 (groß).
+    // Längste Seite ~400 in beiden Fällen → Unterscheidung über kurze Seite.
+    const isLarge = hMm > 260;
+    const matName = 'Mat Front 11';
+    const sizeStr = isLarge ? '365 x 400' : '170 x 400';
+    const qrText = `${matName} | ${sizeStr}`;
+
+    ctx.save();
+    ctx.translate(originX, originY);
+    ctx.rotate(angle);
+
+    // Hintergrund + Rahmen (negativ).
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = Math.max(0.6, H * 0.012);
+    ctx.strokeRect(0, 0, W, H);
+
+    // QR-Code rechts, quadratisch, mit weißem Quiet-Zone-Hintergrund.
+    const pad = Math.max(2, Math.min(W, H) * 0.04);
+    const qrSize = Math.min(H - 2 * pad, W * 0.45);
+    const qrX = W - pad - qrSize;
+    const qrY = (H - qrSize) / 2;
+    drawQr(qrText, qrX, qrY, qrSize, '#000', '#fff');
+
+    // Text-Bereich links.
+    const textX = pad;
+    const textW = qrX - pad - textX;
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+
+    // Schriftgröße so wählen, dass beide Zeilen in textW passen.
+    function fitFont(text, maxW, maxH, weight) {
+      let f = maxH;
+      ctx.font = `${weight ? weight + ' ' : ''}${f}px system-ui, sans-serif`;
+      while (f > 4 && ctx.measureText(text).width > maxW) {
+        f -= 0.5;
+        ctx.font = `${weight ? weight + ' ' : ''}${f}px system-ui, sans-serif`;
+      }
+      return f;
+    }
+    const fMat = fitFont(matName, textW, Math.min(H * 0.32, textW * 0.35), 'bold');
+    const sizeText = `${sizeStr} mm`;
+    const fSize = fitFont(sizeText, textW, Math.min(H * 0.22, textW * 0.28), '');
+
+    ctx.font = `bold ${fMat}px system-ui, sans-serif`;
+    ctx.fillText(matName, textX, H * 0.38);
+
+    ctx.font = `${fSize}px system-ui, sans-serif`;
+    ctx.fillText(sizeText, textX, H * 0.66);
+
+    ctx.restore();
+  }
+
   function resize() {
     // Canvas füllt den kompletten Bildschirm.
     cssW = Math.floor(window.innerWidth);
@@ -215,13 +494,29 @@ INDEX_HTML = """<!doctype html>
 
     // Linien zwischen den Punkten: pro 4er-Gruppe ein geschlossenes Viereck.
     if (mapped.length >= 2) {
-      ctx.strokeStyle = '#ff2a2a';
       ctx.lineWidth = Math.max(2, r * 0.35);
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
       for (let i = 0; i < mapped.length; i += 4) {
         const quad = mapped.slice(i, i + 4);
         if (quad.length < 2) break;
+        // Farbe nach Seitenlängen in mm bestimmen.
+        let color = '#ff2a2a';
+        if (quad.length === 4) {
+          const quadN = points.slice(i, i + 4);
+          const sidesMm = [];
+          for (let j = 0; j < 4; j++) {
+            const k = (j + 1) % 4;
+            const dxN = (quadN[k][0] - quadN[j][0]) * REGION_W_MM;
+            const dyN = (quadN[k][1] - quadN[j][1]) * REGION_H_MM;
+            sidesMm.push(Math.hypot(dxN, dyN));
+          }
+          const longCount = sidesMm.filter(s => s > 300).length;
+          const shortCount = sidesMm.filter(s => s < 300).length;
+          if (longCount === 4) color = '#ff2a2a';
+          else if (shortCount >= 2) color = '#22c55e';
+        }
+        ctx.strokeStyle = color;
         ctx.beginPath();
         ctx.moveTo(quad[0][0], quad[0][1]);
         for (let j = 1; j < quad.length; j++) {
@@ -248,6 +543,37 @@ INDEX_HTML = """<!doctype html>
       for (let i = 0; i + 4 <= points.length; i += 4) {
         const quadN = points.slice(i, i + 4);   // normalisiert (0..1)
         const quadP = mapped.slice(i, i + 4);    // CSS-Pixel
+        // Zuerst das Etikett (konstant 150×90 mm) zentriert auf dem Brett.
+        drawLabel(quadN, quadP, i / 4);
+        // Label-Rechteck in Pixeln für Kollisionsprüfung der Maßangaben.
+        const labelN = labelFrameForQuad(quadN, quadP, i / 4);
+        const labelP = labelN.map(p => applyH(p[0], p[1]));
+        const Lo = labelP[0];
+        const Lx = [labelP[1][0] - Lo[0], labelP[1][1] - Lo[1]];
+        const Ly = [labelP[3][0] - Lo[0], labelP[3][1] - Lo[1]];
+        const Lx2 = Lx[0]*Lx[0] + Lx[1]*Lx[1] || 1;
+        const Ly2 = Ly[0]*Ly[0] + Ly[1]*Ly[1] || 1;
+        function pointInLabel(px, py, padPx) {
+          const rx = px - Lo[0], ry = py - Lo[1];
+          const u = (rx*Lx[0] + ry*Lx[1]) / Lx2;
+          const v = (rx*Ly[0] + ry*Ly[1]) / Ly2;
+          const padU = padPx / Math.sqrt(Lx2);
+          const padV = padPx / Math.sqrt(Ly2);
+          return u >= -padU && u <= 1 + padU && v >= -padV && v <= 1 + padV;
+        }
+        // Echte Kollisionsprüfung: alle vier Eckpunkte des (rotierten)
+        // Text-Hintergrundrechtecks gegen das Label-Rechteck testen.
+        function rectHitsLabel(cxp, cyp, halfW, halfH, ang, padPx) {
+          const ca = Math.cos(ang), sa = Math.sin(ang);
+          const sxs = [-halfW, halfW, halfW, -halfW];
+          const sys = [-halfH, -halfH, halfH, halfH];
+          for (let q = 0; q < 4; q++) {
+            const px = cxp + sxs[q] * ca - sys[q] * sa;
+            const py = cyp + sxs[q] * sa + sys[q] * ca;
+            if (pointInLabel(px, py, padPx)) return true;
+          }
+          return false;
+        }
         // Schwerpunkt des Vierecks (für Beschriftungs-Offset nach innen).
         let cx = 0, cy = 0;
         for (const [x, y] of quadP) { cx += x; cy += y; }
@@ -270,21 +596,53 @@ INDEX_HTML = """<!doctype html>
           if (angle > Math.PI / 2) angle -= Math.PI;
           if (angle < -Math.PI / 2) angle += Math.PI;
 
-          // Senkrecht zur Kante nach innen (Richtung Schwerpunkt) versetzen,
-          // damit die Linie nicht überschrieben wird.
           const elen = Math.hypot(ex, ey) || 1;
-          let nx = -ey / elen, ny = ex / elen;       // Normale zur Kante
+          let nx = -ey / elen, ny = ex / elen;       // Normale zur Kante (nach innen)
           if ((cx - mxp) * nx + (cy - myp) * ny < 0) { nx = -nx; ny = -ny; }
-          const off = fontPx * 0.85;
-          const tx = mxp + nx * off;
-          const ty = myp + ny * off;
+          const pxPerMm = elen / Math.max(1, mm);
+          const edx = ex / elen, edy = ey / elen;     // Einheitsrichtung der Kante
+
+          // Hintergrundrechteck der Beschriftung in Pixel (Halbachsen).
+          ctx.font = `bold ${fontPx}px system-ui, sans-serif`;
+          const tw = ctx.measureText(label).width;
+          const halfW = tw / 2 + 4;
+          const halfH = fontPx / 2 + 2;
+          const padPx = 2;
+
+          // Kandidaten: verschiedene Innen-Offsets und Verschiebungen entlang
+          // der Kante. Nehme den ersten, der das Label nicht überlappt.
+          let tx = mxp + nx * Math.max(fontPx * 0.85, 35 * pxPerMm);
+          let ty = myp + ny * Math.max(fontPx * 0.85, 35 * pxPerMm);
+          const offCandidatesMm = [35, 25, 15, 50, 70, 90, 12];
+          const shiftStepMm = 5;
+          const maxShiftPx = elen / 2 - halfW - 2;
+          let placed = false;
+          outer:
+          for (const om of offCandidatesMm) {
+            const off = Math.max(fontPx * 0.85, om * pxPerMm);
+            const bx = mxp + nx * off;
+            const by = myp + ny * off;
+            for (let s = 0; s <= maxShiftPx; s += shiftStepMm * pxPerMm) {
+              for (const sign of (s === 0 ? [1] : [1, -1])) {
+                const cxp = bx + edx * s * sign;
+                const cyp = by + edy * s * sign;
+                if (!rectHitsLabel(cxp, cyp, halfW, halfH, angle, padPx)) {
+                  tx = cxp; ty = cyp; placed = true; break outer;
+                }
+              }
+            }
+          }
+          if (!placed) {
+            // Letzter Ausweg: knapp neben dem Label vorbei.
+            tx = mxp + nx * Math.max(fontPx * 0.85, 8 * pxPerMm);
+            ty = myp + ny * Math.max(fontPx * 0.85, 8 * pxPerMm);
+          }
 
           ctx.save();
           ctx.translate(tx, ty);
           ctx.rotate(angle);
-          const tw = ctx.measureText(label).width;
           ctx.fillStyle = 'rgba(0,0,0,0.6)';
-          ctx.fillRect(-tw / 2 - 4, -fontPx / 2 - 2, tw + 8, fontPx + 4);
+          ctx.fillRect(-halfW, -halfH, halfW * 2, halfH * 2);
           ctx.fillStyle = '#ffd34d';
           ctx.fillText(label, 0, 0);
           ctx.restore();
@@ -293,6 +651,33 @@ INDEX_HTML = """<!doctype html>
     }
 
     if (calibrating) drawCalibrationOverlay();
+
+    // Pulsierende Fehler-Ränder + Marker (über allem).
+    drawErrorOverlays(mapped);
+  }
+
+  function drawErrorOverlays(mapped) {
+    if (!errors || errors.length === 0 || mapped.length < 4) return;
+    const r = Math.max(6, Math.min(cssW, cssH) * 0.015);
+
+    ctx.save();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    for (let i = 0; i + 4 <= mapped.length; i += 4) {
+      const errIdx = i / 4;
+      const err = errors[errIdx];
+      if (!err) continue;
+
+      // Marker an der Fehlerstelle: einfacher roter Ring.
+      const [mx, my] = applyH(err[0], err[1]);
+      const mr = r * 1.6;
+      ctx.strokeStyle = '#ff2a2a';
+      ctx.lineWidth = Math.max(3, r * 0.45);
+      ctx.beginPath();
+      ctx.arc(mx, my, mr, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   function drawCalibrationOverlay() {
@@ -458,7 +843,7 @@ INDEX_HTML = """<!doctype html>
   // einen Frame aussetzt – solange überhaupt etwas erkannt wird (oder
   // die HOLD_MS-Frist nicht abgelaufen ist), bleibt das letzte bekannte
   // Viereck stehen.
-  let tracked = [];   // Array von { pts: [[x,y]*4], lastSeenAt: ms }
+  let tracked = [];   // Array von { pts: [[x,y]*4], lastSeenAt: ms, error: [x,y]|null }
 
   // Animation: zwischen WebSocket-Updates wird kontinuierlich (per
   // requestAnimationFrame) zwischen den aktuell gezeichneten Punkten
@@ -466,11 +851,16 @@ INDEX_HTML = """<!doctype html>
   // interpoliert. Dadurch entstehen weiche Bewegungen statt Ruckler im
   // 5-fps-Takt der Kamera.
   let targetPoints = [];
+  let targetErrors = [];
   const ANIM_ALPHA = 0.18;          // Annäherung pro Frame (0..1)
   const ANIM_SNAP_DIST = 0.08;      // große Sprünge nicht weichzeichnen
   const ANIM_MIN_STEP = 0.0008;     // unter diesem Rest-Delta direkt einrasten
-  function stabilizePoints(incoming) {
+  function stabilizePoints(incoming, incomingErrors) {
     const newQuads = chunkQuads(incoming);
+    const newErrs = newQuads.map((_, i) => {
+      const e = incomingErrors && incomingErrors[i];
+      return (e && e.length === 2) ? [+e[0], +e[1]] : null;
+    });
     const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
     // 1) Bestehende Tracks per Centroid-Distanz greedy zu neuen Vierecken
@@ -500,6 +890,7 @@ INDEX_HTML = """<!doctype html>
       const aligned = Array.from({ length: 4 }, (_, k) => newQuads[i][(k + rot) % 4]);
       tracked[tIdx].pts = aligned.map((p, k) => smoothPoint(prev[k], p));
       tracked[tIdx].lastSeenAt = now;
+      tracked[tIdx].error = newErrs[i];
     }
 
     // 3) Neue Vierecke (ohne Match) als frische Tracks anhängen.
@@ -508,6 +899,7 @@ INDEX_HTML = """<!doctype html>
       tracked.push({
         pts: newQuads[i].map(p => p.slice()),
         lastSeenAt: now,
+        error: newErrs[i],
       });
     }
 
@@ -518,8 +910,12 @@ INDEX_HTML = """<!doctype html>
 
     // 5) Flach ausgeben (Reihenfolge = Reihenfolge in `tracked`).
     const flat = [];
-    for (const t of tracked) for (const p of t.pts) flat.push(p);
-    return flat;
+    const flatErrs = [];
+    for (const t of tracked) {
+      for (const p of t.pts) flat.push(p);
+      flatErrs.push(t.error || null);
+    }
+    return { points: flat, errors: flatErrs };
   }
 
   let ws = null;
@@ -538,7 +934,12 @@ INDEX_HTML = """<!doctype html>
       try {
         const data = JSON.parse(ev.data);
         const incoming = Array.isArray(data.points) ? data.points : [];
-        targetPoints = stabilizePoints(incoming);
+        const incomingErrs = Array.isArray(data.errors) ? data.errors : [];
+        const stab = stabilizePoints(incoming, incomingErrs);
+        targetPoints = stab.points;
+        targetErrors = stab.errors;
+        // Errors direkt übernehmen (sie werden nicht animiert).
+        errors = targetErrors.slice();
         // Wenn die Anzahl wächst (neues Viereck): die zusätzlichen
         // Slots direkt am Ziel einrasten, damit sie nicht aus dem
         // (0,0)-Default heran-animieren. Bestehende Slots laufen
@@ -551,6 +952,10 @@ INDEX_HTML = """<!doctype html>
         } else if (points.length > targetPoints.length) {
           // Anzahl schrumpft: hinten überzählige verwerfen.
           points.length = targetPoints.length;
+          draw();
+        } else {
+          // Bei gleicher Anzahl: trotzdem neu zeichnen, falls sich nur
+          // der Fehler-Status geändert hat.
           draw();
         }
       } catch (e) { /* ignore */ }
@@ -618,7 +1023,7 @@ def hello() -> HTMLResponse:
 
 @app.get("/points")
 def get_points() -> dict:
-    return {"points": _current_points}
+    return {"points": _current_points, "errors": _current_errors}
 
 
 @app.post("/points")
@@ -629,10 +1034,25 @@ async def set_points(payload: PointsPayload) -> dict:
             raise HTTPException(status_code=400, detail="each point needs [x, y]")
         x, y = float(p[0]), float(p[1])
         cleaned.append((max(0.0, min(1.0, x)), max(0.0, min(1.0, y))))
-    global _current_points
+
+    n_quads = len(cleaned) // 4
+    cleaned_errors: list[list[float] | None] = [None] * n_quads
+    if payload.errors is not None:
+        for i, e in enumerate(payload.errors[:n_quads]):
+            if e is None:
+                cleaned_errors[i] = None
+                continue
+            if len(e) != 2:
+                raise HTTPException(status_code=400, detail="each error needs [x, y] or null")
+            ex = max(0.0, min(1.0, float(e[0])))
+            ey = max(0.0, min(1.0, float(e[1])))
+            cleaned_errors[i] = [ex, ey]
+
+    global _current_points, _current_errors
     _current_points = cleaned
-    await _broadcast_points(cleaned)
-    return {"count": len(cleaned)}
+    _current_errors = cleaned_errors
+    await _broadcast_points(cleaned, cleaned_errors)
+    return {"count": len(cleaned), "errors": sum(1 for e in cleaned_errors if e is not None)}
 
 
 @app.websocket("/ws/points")
@@ -642,7 +1062,10 @@ async def ws_points(ws: WebSocket) -> None:
         _ws_clients.add(ws)
     try:
         # Aktuellen Stand sofort schicken.
-        await ws.send_json({"points": [list(p) for p in _current_points]})
+        await ws.send_json({
+            "points": [list(p) for p in _current_points],
+            "errors": [list(e) if e is not None else None for e in _current_errors],
+        })
         while True:
             # Wir erwarten keine Nachrichten vom Client; receive blockiert,
             # bis die Verbindung geschlossen wird.
