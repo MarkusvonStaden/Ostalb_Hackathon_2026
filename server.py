@@ -2,10 +2,17 @@ import asyncio
 import base64
 import binascii
 import json
+import math
 import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
@@ -56,10 +63,86 @@ async def _capture_loop() -> None:
 @app.on_event("shutdown")
 async def _capture_shutdown() -> None:
     _stop_capture()
+    await _stop_voice_session()
 
 
 _capture_thread: threading.Thread | None = None
 _capture_stop = threading.Event()
+
+# --- Gemini Voice Session ---------------------------------------------------
+_voice_session: "GeminiVoiceSession | None" = None
+_hover_stop_handle: "asyncio.TimerHandle | None" = None
+_HOVER_STOP_DELAY = 2.0
+
+REGION_W_MM = 870
+REGION_H_MM = 470
+
+
+def _board_type(quad_pts: list) -> str:
+    """'large' wenn alle 4 Seiten > 300 mm, sonst 'small'."""
+    sides = []
+    for j in range(4):
+        k = (j + 1) % 4
+        dx = (quad_pts[k][0] - quad_pts[j][0]) * REGION_W_MM
+        dy = (quad_pts[k][1] - quad_pts[j][1]) * REGION_H_MM
+        sides.append(math.hypot(dx, dy))
+    return "large" if all(s > 300 for s in sides) else "small"
+
+
+def _load_prompt(board_type: str) -> str:
+    path = Path(__file__).parent / "prompts" / f"{board_type}_board.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+async def _start_voice_session(board_type: str) -> None:
+    global _voice_session
+    if _voice_session is not None and _voice_session.running:
+        return
+    try:
+        from gemini_voice import GeminiVoiceSession
+        prompt = _load_prompt(board_type)
+        _voice_session = GeminiVoiceSession(system_prompt=prompt)
+        await _voice_session.start()
+    except Exception as exc:
+        print(f"[server] Voice-Session-Start fehlgeschlagen: {exc}")
+        _voice_session = None
+
+
+async def _stop_voice_session() -> None:
+    global _voice_session
+    if _voice_session is None:
+        return
+    try:
+        await _voice_session.stop()
+    except Exception as exc:
+        print(f"[server] Voice-Session-Stop fehlgeschlagen: {exc}")
+    finally:
+        _voice_session = None
+
+
+async def _execute_hover_stop() -> None:
+    global _hover_stop_handle
+    _hover_stop_handle = None
+    await _stop_voice_session()
+
+
+async def _update_voice_hover(any_hover: bool, board_type: str = "large") -> None:
+    global _hover_stop_handle
+    if any_hover:
+        if _hover_stop_handle is not None:
+            _hover_stop_handle.cancel()
+            _hover_stop_handle = None
+        await _start_voice_session(board_type)
+    else:
+        if _hover_stop_handle is None or _hover_stop_handle.cancelled():
+            loop = asyncio.get_running_loop()
+            _hover_stop_handle = loop.call_later(
+                _HOVER_STOP_DELAY,
+                lambda: loop.create_task(_execute_hover_stop()),
+            )
 
 
 def _apply_points(points: list, errors: list | None, hovers: list | None) -> None:
