@@ -494,7 +494,8 @@ INDEX_HTML = """<!doctype html>
 
     // Linien zwischen den Punkten: pro 4er-Gruppe ein geschlossenes Viereck.
     if (mapped.length >= 2) {
-      ctx.lineWidth = Math.max(2, r * 0.35);
+      const mainWidth = Math.max(6, r * 0.9);
+      const haloWidth = mainWidth + Math.max(6, r * 0.7);
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
       for (let i = 0; i < mapped.length; i += 4) {
@@ -502,6 +503,7 @@ INDEX_HTML = """<!doctype html>
         if (quad.length < 2) break;
         // Farbe nach Seitenlängen in mm bestimmen.
         let color = '#ff2a2a';
+        let glow = 'rgba(255, 42, 42, 0.95)';
         if (quad.length === 4) {
           const quadN = points.slice(i, i + 4);
           const sidesMm = [];
@@ -513,17 +515,43 @@ INDEX_HTML = """<!doctype html>
           }
           const longCount = sidesMm.filter(s => s > 300).length;
           const shortCount = sidesMm.filter(s => s < 300).length;
-          if (longCount === 4) color = '#ff2a2a';
-          else if (shortCount >= 2) color = '#22c55e';
+          if (longCount === 4) {
+            color = '#ff2a2a';
+            glow = 'rgba(255, 42, 42, 0.95)';
+          } else if (shortCount >= 2) {
+            color = '#22c55e';
+            glow = 'rgba(34, 197, 94, 0.95)';
+          }
         }
-        ctx.strokeStyle = color;
-        ctx.beginPath();
-        ctx.moveTo(quad[0][0], quad[0][1]);
-        for (let j = 1; j < quad.length; j++) {
-          ctx.lineTo(quad[j][0], quad[j][1]);
-        }
-        if (quad.length === 4) ctx.closePath();
+
+        const drawPath = () => {
+          ctx.beginPath();
+          ctx.moveTo(quad[0][0], quad[0][1]);
+          for (let j = 1; j < quad.length; j++) {
+            ctx.lineTo(quad[j][0], quad[j][1]);
+          }
+          if (quad.length === 4) ctx.closePath();
+        };
+
+        // Dunkler Konturschatten für besseren Kontrast auf jedem Hintergrund.
+        ctx.save();
+        ctx.lineWidth = haloWidth;
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+        drawPath();
         ctx.stroke();
+        ctx.restore();
+
+        // Hauptlinie mit farbigem Glow.
+        ctx.save();
+        ctx.lineWidth = mainWidth;
+        ctx.strokeStyle = color;
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = Math.max(10, r * 1.2);
+        drawPath();
+        ctx.stroke();
+        // Zweiter Strich verstärkt den Glow ohne die Linie zu verbreitern.
+        ctx.stroke();
+        ctx.restore();
       }
     }
 
@@ -852,9 +880,23 @@ INDEX_HTML = """<!doctype html>
   // 5-fps-Takt der Kamera.
   let targetPoints = [];
   let targetErrors = [];
-  const ANIM_ALPHA = 0.18;          // Annäherung pro Frame (0..1)
+  // Frame-rate-unabhängige Glättung: Halbwertszeit, in der sich die
+  // gezeichnete Position der Zielposition halbiert. Kleiner = schneller
+  // (= folgt enger), größer = ruhiger. ~55 ms fühlt sich auf 60/120 Hz
+  // gleich „smooth“ an, ohne sichtbar zu lagen.
+  const ANIM_HALF_LIFE_MS = 55;
   const ANIM_SNAP_DIST = 0.08;      // große Sprünge nicht weichzeichnen
   const ANIM_MIN_STEP = 0.0008;     // unter diesem Rest-Delta direkt einrasten
+  // Vorhersage: Da WS-Updates nur mit ~5 fps kommen, würde das Ziel
+  // zwischen den Frames stehenbleiben und die Box bei kontinuierlicher
+  // Bewegung sichtbar nachhängen. Wir merken uns die letzte Geschwindigkeit
+  // pro Punkt und extrapolieren das Ziel zwischen den Updates leicht nach
+  // vorne. Dadurch folgt die Box „live“ statt stufig hinterher.
+  const PREDICT_MAX_MS = 220;       // wie lange wir maximal extrapolieren
+  const PREDICT_MAX_DIST = 0.05;    // pro Punkt max. 5 % Bildbreite vorausschauen
+  let prevTargetPoints = [];
+  let velTargetPoints = [];          // [vx, vy] in normalisiert pro ms
+  let lastTargetTs = 0;
   function stabilizePoints(incoming, incomingErrors) {
     const newQuads = chunkQuads(incoming);
     const newErrs = newQuads.map((_, i) => {
@@ -936,7 +978,24 @@ INDEX_HTML = """<!doctype html>
         const incoming = Array.isArray(data.points) ? data.points : [];
         const incomingErrs = Array.isArray(data.errors) ? data.errors : [];
         const stab = stabilizePoints(incoming, incomingErrs);
-        targetPoints = stab.points;
+        const newTarget = stab.points;
+        const nowTs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+        // Geschwindigkeit zwischen aufeinanderfolgenden Targets schätzen,
+        // solange Anzahl/Zuordnung gleich bleibt. Bei Anzahländerung
+        // setzen wir die Geschwindigkeit zurück (sonst würde ein neu
+        // hinzugekommener Slot mit fremder Velocity weglaufen).
+        if (lastTargetTs > 0 && prevTargetPoints.length === newTarget.length && newTarget.length > 0) {
+          const dt = Math.max(1, nowTs - lastTargetTs);
+          velTargetPoints = newTarget.map((p, i) => {
+            const pp = prevTargetPoints[i];
+            return [(p[0] - pp[0]) / dt, (p[1] - pp[1]) / dt];
+          });
+        } else {
+          velTargetPoints = newTarget.map(() => [0, 0]);
+        }
+        prevTargetPoints = newTarget.map(p => p.slice());
+        lastTargetTs = nowTs;
+        targetPoints = newTarget;
         targetErrors = stab.errors;
         // Errors direkt übernehmen (sie werden nicht animiert).
         errors = targetErrors.slice();
@@ -977,26 +1036,48 @@ INDEX_HTML = """<!doctype html>
   // des Browsers und schiebt die aktuell gezeichneten Punkte stetig in
   // Richtung der zuletzt empfangenen Zielpunkte. So bleibt die Projektion
   // auch zwischen den (langsameren) WebSocket-Updates flüssig sichtbar.
-  function animate() {
+  let lastFrameTs = 0;
+  function animate(ts) {
+    if (!ts) ts = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    if (!lastFrameTs) lastFrameTs = ts;
+    const dtFrame = Math.min(64, Math.max(1, ts - lastFrameTs));
+    lastFrameTs = ts;
+
     if (targetPoints.length === points.length && points.length > 0) {
+      // Wie weit wir das Ziel anhand der letzten bekannten Geschwindigkeit
+      // in die Zukunft schieben (deckt den ~200 ms Gap zwischen WS-Frames ab).
+      const sinceUpdate = lastTargetTs > 0
+        ? Math.min(PREDICT_MAX_MS, ts - lastTargetTs)
+        : 0;
+      // Frame-rate-unabhängiger Annäherungsfaktor.
+      const alpha = 1 - Math.pow(0.5, dtFrame / ANIM_HALF_LIFE_MS);
       let changed = false;
       for (let i = 0; i < points.length; i++) {
         const p = points[i], t = targetPoints[i];
-        const dx = t[0] - p[0], dy = t[1] - p[1];
+        const v = velTargetPoints[i] || [0, 0];
+        // Vorhergesagtes Ziel = letztes Target + Geschwindigkeit * Zeit.
+        let px = v[0] * sinceUpdate;
+        let py = v[1] * sinceUpdate;
+        const pd = Math.hypot(px, py);
+        if (pd > PREDICT_MAX_DIST) {
+          const s = PREDICT_MAX_DIST / pd;
+          px *= s; py *= s;
+        }
+        const tx = t[0] + px;
+        const ty = t[1] + py;
+        const dx = tx - p[0], dy = ty - p[1];
         const d = Math.hypot(dx, dy);
-        if (d <= ANIM_MIN_STEP) {
-          if (p[0] !== t[0] || p[1] !== t[1]) {
-            p[0] = t[0]; p[1] = t[1]; changed = true;
-          }
-          continue;
-        }
         if (d > ANIM_SNAP_DIST) {
-          p[0] = t[0]; p[1] = t[1];
-        } else {
-          p[0] += dx * ANIM_ALPHA;
-          p[1] += dy * ANIM_ALPHA;
+          p[0] = tx; p[1] = ty;
+          changed = true;
+        } else if (d > ANIM_MIN_STEP) {
+          p[0] += dx * alpha;
+          p[1] += dy * alpha;
+          changed = true;
+        } else if (p[0] !== tx || p[1] !== ty) {
+          p[0] = tx; p[1] = ty;
+          changed = true;
         }
-        changed = true;
       }
       if (changed) draw();
     }
