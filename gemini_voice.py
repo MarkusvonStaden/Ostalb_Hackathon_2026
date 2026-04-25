@@ -41,14 +41,58 @@ def _make_config(system_prompt: str) -> types.LiveConnectConfig:
 
 
 class GeminiVoiceSession:
-    def __init__(self, system_prompt: str = "") -> None:
+    def __init__(
+        self,
+        system_prompt: str = "",
+        input_device: int | str | None = None,
+        output_device: int | str | None = None,
+    ) -> None:
         self._system_prompt = system_prompt
+        self._input_device = input_device
+        self._output_device = output_device
         self._task: asyncio.Task | None = None
         self._pya: pyaudio.PyAudio | None = None
+        self._play_stream = None
+        self._listen_stream = None
+        self._stopping = False
 
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    def _resolve_device(self, selector, want_input: bool) -> int | None:
+        """Map ``selector`` (None | int | str) auf einen PyAudio-Device-Index.
+
+        - ``None`` -> ``None`` (System-Default des Streams)
+        - ``int``  -> direkt verwendet
+        - ``str``  -> case-insensitive Substring-Match auf den Device-Namen.
+        """
+        if selector is None or self._pya is None:
+            return None
+        if isinstance(selector, int):
+            return selector
+        needle = str(selector).strip().lower()
+        if not needle:
+            return None
+        try:
+            count = self._pya.get_device_count()
+        except Exception:
+            return None
+        for i in range(count):
+            try:
+                info = self._pya.get_device_info_by_index(i)
+            except Exception:
+                continue
+            channels = info.get(
+                "maxInputChannels" if want_input else "maxOutputChannels", 0
+            )
+            if not channels:
+                continue
+            name = str(info.get("name", "")).lower()
+            if needle in name:
+                return int(info["index"])
+        print(f"[gemini_voice] Audio-Device nicht gefunden: {selector!r}")
+        return None
 
     async def start(self) -> None:
         if self.running:
@@ -63,12 +107,31 @@ class GeminiVoiceSession:
         if task is None or task.done():
             self._task = None
             return
+        # Sofortigen Audio-Abbruch erzwingen, damit ``stream.write`` im
+        # Worker-Thread nicht weiter blockiert. Ohne das wartet ``await task``
+        # bis die laufende Antwort komplett abgespielt ist.
+        self._stopping = True
+        play_stream = self._play_stream
+        if play_stream is not None:
+            try:
+                await asyncio.to_thread(play_stream.stop_stream)
+            except Exception:
+                pass
+        listen_stream = self._listen_stream
+        if listen_stream is not None:
+            try:
+                await asyncio.to_thread(listen_stream.stop_stream)
+            except Exception:
+                pass
         task.cancel()
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
+            await asyncio.wait_for(task, timeout=3.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
         self._task = None
+        self._play_stream = None
+        self._listen_stream = None
+        self._stopping = False
         print("[gemini_voice] Session gestoppt")
 
     async def _run(self) -> None:
@@ -103,26 +166,37 @@ class GeminiVoiceSession:
                 self._pya = None
 
     async def _listen_audio(self, out_queue: asyncio.Queue, state: dict) -> None:
-        mic_info = await asyncio.to_thread(self._pya.get_default_input_device_info)
+        input_index = self._resolve_device(self._input_device, want_input=True)
+        if input_index is None:
+            mic_info = await asyncio.to_thread(self._pya.get_default_input_device_info)
+            input_index = mic_info["index"]
+        print(f"[gemini_voice] Mikrofon-Index: {input_index}")
         stream = await asyncio.to_thread(
             self._pya.open,
             format=FORMAT,
             channels=CHANNELS,
             rate=SEND_SAMPLE_RATE,
             input=True,
-            input_device_index=mic_info["index"],
+            input_device_index=input_index,
             frames_per_buffer=CHUNK_SIZE,
         )
+        self._listen_stream = stream
         try:
-            while True:
-                data = await asyncio.to_thread(
-                    stream.read, CHUNK_SIZE, **{"exception_on_overflow": False}
-                )
+            while not self._stopping:
+                try:
+                    data = await asyncio.to_thread(
+                        stream.read, CHUNK_SIZE, **{"exception_on_overflow": False}
+                    )
+                except OSError:
+                    break
                 cooldown = (time.monotonic() - state["playback_end_time"]) < 0.4
                 if not state["is_playing"] and not cooldown:
                     await out_queue.put({"data": data, "mime_type": "audio/pcm"})
         finally:
-            await asyncio.to_thread(stream.close)
+            try:
+                await asyncio.to_thread(stream.close)
+            except Exception:
+                pass
 
     async def _send_realtime(self, session, out_queue: asyncio.Queue) -> None:
         while True:
@@ -148,33 +222,48 @@ class GeminiVoiceSession:
     async def _play_audio(
         self, audio_in_queue: asyncio.Queue, out_queue: asyncio.Queue, state: dict
     ) -> None:
+        output_index = self._resolve_device(self._output_device, want_input=False)
+        print(f"[gemini_voice] Speaker-Index: {output_index if output_index is not None else 'default'}")
         stream = await asyncio.to_thread(
             self._pya.open,
             format=FORMAT,
             channels=CHANNELS,
             rate=RECEIVE_SAMPLE_RATE,
             output=True,
+            output_device_index=output_index,
             frames_per_buffer=CHUNK_SIZE * 4,
         )
+        self._play_stream = stream
+        # Slice-Größe: ~100 ms bei 24 kHz / 16 bit mono. Klein genug, damit
+        # ``stream.write`` schnell zurückkehrt und Cancellation greifen kann.
+        slice_bytes = RECEIVE_SAMPLE_RATE // 10 * 2
         try:
-            while True:
+            while not self._stopping:
                 bytestream = await audio_in_queue.get()
-                # Coalesce all immediately available chunks to reduce gaps
                 while True:
                     try:
                         bytestream += audio_in_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
                 state["is_playing"] = True
-                await asyncio.to_thread(stream.write, bytestream)
+                offset = 0
+                while offset < len(bytestream) and not self._stopping:
+                    chunk = bytestream[offset : offset + slice_bytes]
+                    try:
+                        await asyncio.to_thread(stream.write, chunk)
+                    except OSError:
+                        break
+                    offset += slice_bytes
                 if audio_in_queue.empty():
                     state["is_playing"] = False
                     state["playback_end_time"] = time.monotonic()
-                    # Drain mic data accumulated during playback
                     while True:
                         try:
                             out_queue.get_nowait()
                         except asyncio.QueueEmpty:
                             break
         finally:
-            await asyncio.to_thread(stream.close)
+            try:
+                await asyncio.to_thread(stream.close)
+            except Exception:
+                pass

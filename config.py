@@ -27,6 +27,12 @@ DEFAULTS: dict[str, Any] = {
         "url": "http://127.0.0.1:8000/",
         "kiosk": True,
     },
+    "audio": {
+        # ``None`` = System-Default. Sonst entweder ein int (PyAudio-Device-Index)
+        # oder ein string (Teil-Match auf den Device-Namen, case-insensitive).
+        "input_device": None,
+        "output_device": None,
+    },
 }
 
 
@@ -42,7 +48,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def _env_overrides() -> dict[str, Any]:
     env = os.environ
-    out: dict[str, Any] = {"camera": {}, "server": {}}
+    out: dict[str, Any] = {"camera": {}, "server": {}, "audio": {}}
     if "OSTALB_CAMERA_INDEX" in env:
         out["camera"]["index"] = int(env["OSTALB_CAMERA_INDEX"])
     if "OSTALB_CAMERA_WIDTH" in env:
@@ -61,6 +67,12 @@ def _env_overrides() -> dict[str, Any]:
         out["server"]["url"] = env["OSTALB_KIOSK_URL"]
     if "OSTALB_NO_KIOSK" in env and env["OSTALB_NO_KIOSK"] == "1":
         out["server"]["kiosk"] = False
+    if "OSTALB_AUDIO_INPUT" in env:
+        v = env["OSTALB_AUDIO_INPUT"]
+        out["audio"]["input_device"] = int(v) if v.lstrip("-").isdigit() else v
+    if "OSTALB_AUDIO_OUTPUT" in env:
+        v = env["OSTALB_AUDIO_OUTPUT"]
+        out["audio"]["output_device"] = int(v) if v.lstrip("-").isdigit() else v
     return out
 
 

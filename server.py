@@ -103,8 +103,14 @@ async def _start_voice_session(board_type: str) -> None:
         return
     try:
         from gemini_voice import GeminiVoiceSession
+        from config import load_config
         prompt = _load_prompt(board_type)
-        _voice_session = GeminiVoiceSession(system_prompt=prompt)
+        audio_cfg = load_config().get("audio", {}) or {}
+        _voice_session = GeminiVoiceSession(
+            system_prompt=prompt,
+            input_device=audio_cfg.get("input_device"),
+            output_device=audio_cfg.get("output_device"),
+        )
         await _voice_session.start()
     except Exception as exc:
         print(f"[server] Voice-Session-Start fehlgeschlagen: {exc}")
@@ -170,6 +176,18 @@ def _apply_points(points: list, errors: list | None, hovers: list | None) -> Non
         return
     asyncio.run_coroutine_threadsafe(
         _broadcast_points(cleaned, cleaned_errors, cleaned_hovers), loop,
+    )
+    # Voice-Session steuern: starten/stoppen je nach Hand-über-Brett.
+    any_hover = any(cleaned_hovers)
+    board_type = "large"
+    for i, h in enumerate(cleaned_hovers):
+        if h:
+            quad = cleaned[i * 4 : i * 4 + 4]
+            if len(quad) == 4:
+                board_type = _board_type(quad)
+            break
+    asyncio.run_coroutine_threadsafe(
+        _update_voice_hover(any_hover, board_type), loop,
     )
 
 

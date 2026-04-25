@@ -1,0 +1,17 @@
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+python-dotenv>=1.0.1
+
+# Google Gemini SDK (genai + Live API)
+google-genai>=0.8.0
+
+# Audio I/O (gemini_voice.py, test.py)
+PyAudio>=0.2.14
+
+# Vision / Bildverarbeitung
+opencv-python>=4.10.0
+numpy>=1.26.0
+Pillow>=10.3.0
+mediapipe>=0.10.14

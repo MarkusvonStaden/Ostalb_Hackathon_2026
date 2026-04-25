@@ -40,7 +40,7 @@ DEFAULT_MODE = "audio"
 
 client = genai.Client(
     http_options={"api_version": "v1beta"},
-    api_key="api_key",
+    api_key="api-key",
 )
 
 
