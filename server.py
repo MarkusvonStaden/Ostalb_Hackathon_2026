@@ -518,11 +518,6 @@ def _launch_webcam_once(camera_cfg: dict, server_url: str) -> None:
                 width=camera_cfg.get("width"),
                 height=camera_cfg.get("height"),
                 rotate=int(camera_cfg.get("rotate", 0)),
-                threshold=(
-                    None if camera_cfg.get("threshold", -1) is None
-                    or int(camera_cfg.get("threshold", -1)) < 0
-                    else int(camera_cfg.get("threshold"))
-                ),
             )
         except Exception as exc:
             print(f"[server] Webcam-Pipeline beendet: {exc}")
