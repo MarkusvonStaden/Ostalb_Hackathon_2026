@@ -1034,11 +1034,14 @@ INDEX_HTML = """<!doctype html>
   let prevTargetPoints = [];
   let velTargetPoints = [];          // [vx, vy] in normalisiert pro ms
   let lastTargetTs = 0;
-  function stabilizePoints(incoming, incomingErrors) {
+  function stabilizePoints(incoming, incomingErrors, incomingHovers) {
     const newQuads = chunkQuads(incoming);
     const newErrs = newQuads.map((_, i) => {
       const e = incomingErrors && incomingErrors[i];
       return (e && e.length === 2) ? [+e[0], +e[1]] : null;
+    });
+    const newHovers = newQuads.map((_, i) => {
+      return !!(incomingHovers && incomingHovers[i]);
     });
     const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
@@ -1070,6 +1073,7 @@ INDEX_HTML = """<!doctype html>
       tracked[tIdx].pts = aligned.map((p, k) => smoothPoint(prev[k], p));
       tracked[tIdx].lastSeenAt = now;
       tracked[tIdx].error = newErrs[i];
+      tracked[tIdx].hover = newHovers[i];
     }
 
     // 3) Neue Vierecke (ohne Match) als frische Tracks anhängen.
@@ -1079,6 +1083,7 @@ INDEX_HTML = """<!doctype html>
         pts: newQuads[i].map(p => p.slice()),
         lastSeenAt: now,
         error: newErrs[i],
+        hover: newHovers[i],
       });
     }
 
@@ -1090,11 +1095,13 @@ INDEX_HTML = """<!doctype html>
     // 5) Flach ausgeben (Reihenfolge = Reihenfolge in `tracked`).
     const flat = [];
     const flatErrs = [];
+    const flatHovers = [];
     for (const t of tracked) {
       for (const p of t.pts) flat.push(p);
       flatErrs.push(t.error || null);
+      flatHovers.push(!!t.hover);
     }
-    return { points: flat, errors: flatErrs };
+    return { points: flat, errors: flatErrs, hovers: flatHovers };
   }
 
   let ws = null;
@@ -1114,7 +1121,8 @@ INDEX_HTML = """<!doctype html>
         const data = JSON.parse(ev.data);
         const incoming = Array.isArray(data.points) ? data.points : [];
         const incomingErrs = Array.isArray(data.errors) ? data.errors : [];
-        const stab = stabilizePoints(incoming, incomingErrs);
+        const incomingHovers = Array.isArray(data.hovers) ? data.hovers : [];
+        const stab = stabilizePoints(incoming, incomingErrs, incomingHovers);
         const newTarget = stab.points;
         const nowTs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
         // Geschwindigkeit zwischen aufeinanderfolgenden Targets schätzen,
@@ -1136,7 +1144,7 @@ INDEX_HTML = """<!doctype html>
         targetErrors = stab.errors;
         // Errors und Hovers direkt übernehmen (sie werden nicht animiert).
         errors = targetErrors.slice();
-        hovers = Array.isArray(data.hovers) ? data.hovers.slice() : [];
+        hovers = stab.hovers.slice();
         // Wenn die Anzahl wächst (neues Viereck): die zusätzlichen
         // Slots direkt am Ziel einrasten, damit sie nicht aus dem
         // (0,0)-Default heran-animieren. Bestehende Slots laufen

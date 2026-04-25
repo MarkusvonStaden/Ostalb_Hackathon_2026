@@ -1,8 +1,17 @@
 import base64
+import os
 import time
 import cv2
 import numpy as np
 from pathlib import Path
+
+# MediaPipe/TFLite/absl-Logs runterdrehen, sonst spamen sie pro Frame Warnungen
+# (XNNPACK delegate, inference_feedback_manager, landmark_projection_calculator).
+# Muss vor dem Import von mediapipe gesetzt werden.
+os.environ.setdefault("GLOG_minloglevel", "2")        # 0=INFO, 1=WARN, 2=ERROR, 3=FATAL
+os.environ.setdefault("GLOG_logtostderr", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")    # TFLite: nur Errors
+os.environ.setdefault("absl_log_level", "error")
 
 _hand_detector = None
 _hand_detector_video = False
@@ -13,6 +22,13 @@ def _get_hand_detector():
     if _hand_detector is not None:
         return _hand_detector
     try:
+        # absl ggf. vorhanden -> Log-Level explizit setzen (Umgebungsvariablen
+        # werden von manchen Builds ignoriert).
+        try:
+            from absl import logging as _absl_logging
+            _absl_logging.set_verbosity(_absl_logging.ERROR)
+        except Exception:
+            pass
         import mediapipe as mp
         from mediapipe.tasks import python as _mp_python
         from mediapipe.tasks.python import vision as _mp_vision
@@ -32,24 +48,16 @@ def _get_hand_detector():
         return None
 
 
-def _compute_hovers(
-    region_bgr: np.ndarray,
-    contours_norm: list,
-) -> list[bool]:
-    """Gibt pro Brett an, ob gerade eine Hand darueber erkannt wird.
+def _detect_hand_landmarks(region_bgr: np.ndarray):
+    """Erkennt Hand-Landmarks im gewarpten Region-Bild.
 
-    Arbeitet direkt auf dem bereits gewarpten Region-Bild (deutlich kleiner
-    als das Vollbild) und nutzt MediaPipe im VIDEO-Modus mit internem
-    Tracking.
+    Liefert die ``hand_landmarks``-Liste von MediaPipe (oder ``[]``, wenn
+    keine Hand gefunden / Detektor nicht verfuegbar).
     """
-    hovers = [False] * len(contours_norm)
     detector = _get_hand_detector()
-    if detector is None or not contours_norm or region_bgr is None or region_bgr.size == 0:
-        return hovers
-
+    if detector is None or region_bgr is None or region_bgr.size == 0:
+        return []
     import mediapipe as mp
-
-    rh, rw = region_bgr.shape[:2]
     rgb = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     if _hand_detector_video:
@@ -57,10 +65,30 @@ def _compute_hovers(
         result = detector.detect_for_video(mp_image, ts_ms)
     else:
         result = detector.detect(mp_image)
-    if not result.hand_landmarks:
-        return hovers
+    return result.hand_landmarks or []
 
-    # Brett-Quads in Region-Pixelkoordinaten
+
+def _hovers_from_landmarks(
+    hand_landmarks,
+    region_shape: tuple[int, int],
+    contours_norm: list,
+) -> tuple[list[bool], list[list[float] | None]]:
+    """Berechnet pro Brett, ob eine Hand darueber liegt.
+
+    Liefert zusaetzlich pro Brett die normalisierte Position des
+    Palmenmittelpunkts (oder ``None``, wenn keine Hand drueber war), damit
+    der Aufrufer den Punkt genau dort einzeichnen kann.
+
+    Erwartet bereits erkannte ``hand_landmarks`` (siehe
+    :func:`_detect_hand_landmarks`), damit der MediaPipe-Aufruf nur einmal
+    pro Frame passiert.
+    """
+    hovers = [False] * len(contours_norm)
+    hover_points: list[list[float] | None] = [None] * len(contours_norm)
+    if not hand_landmarks or not contours_norm:
+        return hovers, hover_points
+
+    rh, rw = region_shape
     nx = max(1, rw - 1)
     ny = max(1, rh - 1)
     quads_px = [
@@ -68,20 +96,23 @@ def _compute_hovers(
         for quad in contours_norm
     ]
 
-    # Palmenmittelpunkt jeder erkannten Hand pruefen
-    # Landmarks 0 (Handwurzel) + 5,9,13,17 (MCP-Gelenke) = Handflaechen-Zentrum
+    # Palmenmittelpunkt: Landmarks 0 (Handwurzel) + 5,9,13,17 (MCP-Gelenke)
     palm_indices = (0, 5, 9, 13, 17)
-    for hand_lms in result.hand_landmarks:
+    for hand_lms in hand_landmarks:
         xs = [hand_lms[i].x for i in palm_indices]
         ys = [hand_lms[i].y for i in palm_indices]
-        rx = (sum(xs) / len(xs)) * rw
-        ry = (sum(ys) / len(ys)) * rh
-
+        nx_norm = sum(xs) / len(xs)
+        ny_norm = sum(ys) / len(ys)
+        rx = nx_norm * rw
+        ry = ny_norm * rh
         for qi, quad_px in enumerate(quads_px):
             if not hovers[qi] and cv2.pointPolygonTest(quad_px, (float(rx), float(ry)), False) >= 0:
                 hovers[qi] = True
-
-    return hovers
+                hover_points[qi] = [
+                    round(max(0.0, min(1.0, float(nx_norm))), 4),
+                    round(max(0.0, min(1.0, float(ny_norm))), 4),
+                ]
+    return hovers, hover_points
 
 PANEL_H = 540          # unified panel height; width scales with aspect ratio
 REGION_ASPECT = 87 / 47  # width / height of the known region between markers
@@ -110,6 +141,14 @@ DOT_MAX_AREA_FRAC = 0.05      # max. 5 % der Region (sonst kein „Punkt“)
 # Wird invalidiert, sobald sich die Frame-Auflösung ändert.
 _LAST_MARKERS: dict[int, np.ndarray] = {}
 _LAST_MARKERS_SHAPE: tuple[int, int] | None = None
+
+# Cache der zuletzt erkannten Brett-Vierecke. Wird verwendet, wenn im
+# aktuellen Frame eine Hand erkannt wurde - dann skippen wir die teure
+# Kontur-/Blob-Erkennung und liefern den letzten stabilen Stand zurueck.
+_LAST_QUADS_NORM: list = []
+_LAST_QUADS_PX: list = []
+_LAST_ERRORS: list = []
+_LAST_DOTS: list = []
 
 # ArUco-Detector ist teuer zu konstruieren -> einmalig cachen.
 _ARUCO_DETECTOR = None
@@ -336,54 +375,102 @@ def process_frame(
     else:
         gray = to_intensity(frame, contour_channel)
 
-    # Invertiert: Bretter (dunkel) -> weiss; noetig fuer RETR_EXTERNAL,
-    # damit findContours die Bretter und nicht den Hintergrund verfolgt.
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    # Nur ÄUSSERE Konturen, sonst werden Innen- und Außenrand der Bretter
-    # doppelt gefunden und die Eck-Erkennung springt zwischen beiden.
-    raw_contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    ref = 2 * (gray.shape[1] + gray.shape[0])
-    min_px = CONTOUR_MIN_LEN * ref
-    max_px = CONTOUR_MAX_LEN * ref
-    filtered_contours = [
-        c for c in raw_contours
-        if min_px <= cv2.arcLength(c, True) <= max_px
-    ]
     h, w = gray.shape[:2]
     nx = max(1, w - 1)
     ny = max(1, h - 1)
-    result = []
-    quads_px: list[np.ndarray] = []
-    for c in filtered_contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4:
-            continue
-        quad = approx.reshape(4, 2).astype(np.float32)
-        quads_px.append(quad.astype(np.int32))
-        normalized = [[round(float(x) / nx, 4), round(float(y) / ny, 4)] for x, y in quad]
-        result.append(normalized)
 
-    # Blaue Fehler-Punkte nur in der gewarpten Region suchen (außerhalb
-    # gibt es keine sinnvolle Bezugsfläche). Pro Brett-Quad max. einen
-    # Treffer (größte Fläche gewinnt).
-    errors: list[list[float] | None] = [None] * len(result)
-    dot_mask = np.zeros((h, w), dtype=np.uint8)
-    dots: list[tuple[float, float, float]] = []
-    if region is not None and quads_px:
-        dots, dot_mask = detect_blue_dots(region)
-        # Sortiere nach Fläche absteigend, damit der größte Punkt pro
-        # Brett gewinnt.
-        for dx, dy, area in sorted(dots, key=lambda d: d[2], reverse=True):
-            px = dx * nx
-            py = dy * ny
-            for qi, quad_px in enumerate(quads_px):
-                if errors[qi] is not None:
-                    continue
-                if cv2.pointPolygonTest(quad_px, (float(px), float(py)), False) >= 0:
-                    errors[qi] = [round(dx, 4), round(dy, 4)]
-                    break
+    # Hand-Erkennung zuerst: liegt eine Hand im Frame, frieren wir die
+    # zuletzt bekannten Vierecke ein und ueberspringen Kontur-/Blob-
+    # Detection komplett (verhindert Flicker durch verdeckte Bretter).
+    hand_landmarks = []
+    if region is not None:
+        try:
+            hand_landmarks = _detect_hand_landmarks(region)
+        except Exception as hand_exc:
+            print(f"[vision] Hand-Detection: {hand_exc}", file=__import__('sys').stderr)
+            hand_landmarks = []
+    hand_present = bool(hand_landmarks)
+
+    global _LAST_QUADS_NORM, _LAST_QUADS_PX, _LAST_ERRORS, _LAST_DOTS
+
+    if hand_present:
+        # Cache wiederverwenden, keine neue Erkennung.
+        result = [list(map(list, quad)) for quad in _LAST_QUADS_NORM]
+        quads_px = [q.copy() for q in _LAST_QUADS_PX]
+        errors = list(_LAST_ERRORS)
+        dots = list(_LAST_DOTS)
+        # Threshold-/Kontur-Visualisierung: Platzhalter, damit Stages nicht
+        # leer sind.
+        thresh = np.zeros((h, w), dtype=np.uint8)
+        filtered_contours: list = []
+        dot_mask = np.zeros((h, w), dtype=np.uint8)
+    else:
+        # Invertiert: Bretter (dunkel) -> weiss; noetig fuer RETR_EXTERNAL,
+        # damit findContours die Bretter und nicht den Hintergrund verfolgt.
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Nur ÄUSSERE Konturen, sonst werden Innen- und Außenrand der Bretter
+        # doppelt gefunden und die Eck-Erkennung springt zwischen beiden.
+        raw_contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        ref = 2 * (gray.shape[1] + gray.shape[0])
+        min_px = CONTOUR_MIN_LEN * ref
+        max_px = CONTOUR_MAX_LEN * ref
+        filtered_contours = [
+            c for c in raw_contours
+            if min_px <= cv2.arcLength(c, True) <= max_px
+        ]
+        result = []
+        quads_px = []
+        for c in filtered_contours:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) != 4:
+                continue
+            quad = approx.reshape(4, 2).astype(np.float32)
+            quads_px.append(quad.astype(np.int32))
+            normalized = [[round(float(x) / nx, 4), round(float(y) / ny, 4)] for x, y in quad]
+            result.append(normalized)
+
+        # Blaue Fehler-Punkte nur in der gewarpten Region suchen (außerhalb
+        # gibt es keine sinnvolle Bezugsfläche). Pro Brett-Quad max. einen
+        # Treffer (größte Fläche gewinnt).
+        errors = [None] * len(result)
+        dot_mask = np.zeros((h, w), dtype=np.uint8)
+        dots = []
+        if region is not None and quads_px:
+            dots, dot_mask = detect_blue_dots(region)
+            # Sortiere nach Fläche absteigend, damit der größte Punkt pro
+            # Brett gewinnt.
+            for dx, dy, area in sorted(dots, key=lambda d: d[2], reverse=True):
+                px = dx * nx
+                py = dy * ny
+                for qi, quad_px in enumerate(quads_px):
+                    if errors[qi] is not None:
+                        continue
+                    if cv2.pointPolygonTest(quad_px, (float(px), float(py)), False) >= 0:
+                        errors[qi] = [round(dx, 4), round(dy, 4)]
+                        break
+
+        # Cache aktualisieren (nur wenn frisch erkannt).
+        _LAST_QUADS_NORM = [list(map(list, quad)) for quad in result]
+        _LAST_QUADS_PX = [q.copy() for q in quads_px]
+        _LAST_ERRORS = list(errors)
+        _LAST_DOTS = list(dots)
+
+    # Hovers koennen wir direkt aus den bereits erkannten Landmarks
+    # ableiten, ohne MediaPipe ein zweites Mal zu rufen.
+    if region is not None and result:
+        hovers, hover_points = _hovers_from_landmarks(hand_landmarks, (h, w), result)
+    else:
+        hovers = [False] * len(result)
+        hover_points = [None] * len(result)
+
+    # Wo eine Hand ueber einem Brett liegt, soll der Anzeigepunkt direkt an
+    # der Handposition erscheinen - das ueberschreibt den ggf. gecachten
+    # blauen Klebepunkt fuer dieses Brett.
+    for qi, hp in enumerate(hover_points):
+        if hp is not None and qi < len(errors):
+            errors[qi] = hp
 
     if not return_stages:
         return result, errors
@@ -414,6 +501,8 @@ def process_frame(
         "contour_channel": contour_channel,
         "errors": errors,
         "dot_mask": dot_mask,
+        "hovers": hovers,
+        "hand_present": hand_present,
     }
     return result, errors, stages
 
@@ -541,12 +630,7 @@ def run_capture_loop(
                     frame, return_stages=True, contour_channel=contour_channel,
                 )
                 flat = [[float(x), float(y)] for c in contours for x, y in c]
-                hovers: list[bool] = [False] * len(contours)
-                if stages.get("region") is not None and stages.get("corners") is not None:
-                    try:
-                        hovers = _compute_hovers(stages["region"], contours)
-                    except Exception as hover_exc:
-                        print(f"[vision] Hand-Hover: {hover_exc}", file=__import__('sys').stderr)
+                hovers = stages.get("hovers") or [False] * len(contours)
                 try:
                     on_result(flat, errors, hovers)
                 except Exception as cb_exc:
@@ -611,12 +695,7 @@ def run_webcam(
                             stages["region"], stages.get("contour_channel", contour_channel),
                         )
                     flat = [[float(x), float(y)] for c in contours for x, y in c]
-                    hovers: list[bool] = [False] * len(contours)
-                    if stages.get("region") is not None and stages.get("corners") is not None:
-                        try:
-                            hovers = _compute_hovers(stages["region"], contours)
-                        except Exception as hover_exc:
-                            print(f"[vision] Hand-Hover: {hover_exc}", file=__import__('sys').stderr)
+                    hovers = stages.get("hovers") or [False] * len(contours)
                     _post_points(flat, server_url, errors=errors, hovers=hovers)
                     if show is False:
                         n_err = sum(1 for e in errors if e is not None)
