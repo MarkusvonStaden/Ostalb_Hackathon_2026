@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import os
@@ -5,7 +6,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
@@ -26,6 +27,40 @@ class PointsPayload(BaseModel):
 
 # Aktuell zu projizierende Punkte (normalisiert, 0..1).
 _current_points: list[tuple[float, float]] = []
+
+# WebSocket-Clients, die Punkt-Updates abonnieren.
+_ws_clients: set[WebSocket] = set()
+_ws_lock = threading.Lock()
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+
+@app.on_event("startup")
+async def _capture_loop() -> None:
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+
+
+async def _broadcast_points(points: list[tuple[float, float]]) -> None:
+    msg = {"points": [list(p) for p in points]}
+    with _ws_lock:
+        clients = list(_ws_clients)
+    dead: list[WebSocket] = []
+    for ws in clients:
+        try:
+            await ws.send_json(msg)
+        except Exception:
+            dead.append(ws)
+    if dead:
+        with _ws_lock:
+            for ws in dead:
+                _ws_clients.discard(ws)
+
+
+def _schedule_broadcast(points: list[tuple[float, float]]) -> None:
+    loop = _main_loop
+    if loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(_broadcast_points(points), loop)
 
 
 INDEX_HTML = """<!doctype html>
@@ -170,10 +205,30 @@ INDEX_HTML = """<!doctype html>
     ctx.fillRect(0, 0, cssW, cssH);
 
     // Datenpunkte (durch Homographie gemappt).
-    ctx.fillStyle = '#ff2a2a';
     const r = Math.max(6, Math.min(cssW, cssH) * 0.015);
-    for (const p of points) {
-      const [x, y] = applyH(p[0], p[1]);
+    const mapped = points.map(p => applyH(p[0], p[1]));
+
+    // Linien zwischen den Punkten: pro 4er-Gruppe ein geschlossenes Viereck.
+    if (mapped.length >= 2) {
+      ctx.strokeStyle = '#ff2a2a';
+      ctx.lineWidth = Math.max(2, r * 0.35);
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      for (let i = 0; i < mapped.length; i += 4) {
+        const quad = mapped.slice(i, i + 4);
+        if (quad.length < 2) break;
+        ctx.beginPath();
+        ctx.moveTo(quad[0][0], quad[0][1]);
+        for (let j = 1; j < quad.length; j++) {
+          ctx.lineTo(quad[j][0], quad[j][1]);
+        }
+        if (quad.length === 4) ctx.closePath();
+        ctx.stroke();
+      }
+    }
+
+    ctx.fillStyle = '#ff2a2a';
+    for (const [x, y] of mapped) {
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fill();
@@ -299,21 +354,38 @@ INDEX_HTML = """<!doctype html>
     }
   });
 
-  async function poll() {
+  // ---- WebSocket: laufende Punkt-Updates ----
+  let ws = null;
+  let wsRetry = 0;
+  function connectWS() {
+    const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+    const url = proto + '//' + location.host + '/ws/points';
     try {
-      const res = await fetch('/points', { cache: 'no-store' });
-      if (res.ok) {
-        const data = await res.json();
+      ws = new WebSocket(url);
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+    ws.onopen = () => { wsRetry = 0; };
+    ws.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
         points = Array.isArray(data.points) ? data.points : [];
         draw();
-      }
-    } catch (e) { /* ignore */ }
+      } catch (e) { /* ignore */ }
+    };
+    ws.onclose = () => { ws = null; scheduleReconnect(); };
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  }
+  function scheduleReconnect() {
+    wsRetry = Math.min(wsRetry + 1, 6);
+    const delay = Math.min(5000, 250 * Math.pow(2, wsRetry));
+    setTimeout(connectWS, delay);
   }
 
   window.addEventListener('resize', resize);
   resize();
-  poll();
-  setInterval(poll, 1000);
+  connectWS();
 
   // Im Kiosk-Modus liegt der Tastatur-Fokus manchmal nicht auf dem Canvas,
   // wodurch C/R/Pfeiltasten ignoriert würden. Window/Canvas explizit fokussieren.
@@ -338,7 +410,7 @@ def get_points() -> dict:
 
 
 @app.post("/points")
-def set_points(payload: PointsPayload) -> dict:
+async def set_points(payload: PointsPayload) -> dict:
     cleaned: list[tuple[float, float]] = []
     for p in payload.points:
         if len(p) != 2:
@@ -347,7 +419,29 @@ def set_points(payload: PointsPayload) -> dict:
         cleaned.append((max(0.0, min(1.0, x)), max(0.0, min(1.0, y))))
     global _current_points
     _current_points = cleaned
+    await _broadcast_points(cleaned)
     return {"count": len(cleaned)}
+
+
+@app.websocket("/ws/points")
+async def ws_points(ws: WebSocket) -> None:
+    await ws.accept()
+    with _ws_lock:
+        _ws_clients.add(ws)
+    try:
+        # Aktuellen Stand sofort schicken.
+        await ws.send_json({"points": [list(p) for p in _current_points]})
+        while True:
+            # Wir erwarten keine Nachrichten vom Client; receive blockiert,
+            # bis die Verbindung geschlossen wird.
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        with _ws_lock:
+            _ws_clients.discard(ws)
 
 
 @app.post("/upload")

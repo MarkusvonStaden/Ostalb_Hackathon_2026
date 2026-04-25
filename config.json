@@ -5,7 +5,7 @@
     "height": 720,
     "fps": 5,
     "enabled": true,
-    "show_preview": true,
+    "show_preview": false,
     "rotate": 180,
     "threshold": -1
   },
