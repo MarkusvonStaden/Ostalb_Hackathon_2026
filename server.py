@@ -97,14 +97,35 @@ def _load_prompt(board_type: str) -> str:
         return ""
 
 
-async def _start_voice_session(board_type: str) -> None:
+def _format_error_info(error: list[float] | None) -> str:
+    """Erzeugt einen Prompt-Zusatz, wenn auf dem Brett ein Fehler (blauer
+    Klebepunkt) erkannt wurde. ``error`` ist ``[x, y]`` in normalisierten
+    Region-Koordinaten (0..1) oder ``None``.
+    """
+    if not error or len(error) < 2:
+        return (
+            "\n\nQualitaetspruefung:\n"
+            "Auf diesem Brett wurde KEIN Fehler erkannt. Das Bauteil ist in "
+            "Ordnung und kann wie vorgesehen in das angegebene Tray gelegt "
+            "werden."
+        )
+    return (
+        "\n\nWICHTIG - Fehler erkannt:\n"
+        "Auf diesem Brett wurde ein Fehler markiert (blauer Klebepunkt).\n"
+        "Weise den Mitarbeiter auf den Fehler hin und erklaere, dass das "
+        "Bauteil nicht in das Tray gelegt, sondern zur Nacharbeit gegeben "
+        "werden muss."
+    )
+
+
+async def _start_voice_session(board_type: str, error: list[float] | None = None) -> None:
     global _voice_session
     if _voice_session is not None and _voice_session.running:
         return
     try:
         from gemini_voice import GeminiVoiceSession
         from config import load_config
-        prompt = _load_prompt(board_type)
+        prompt = _load_prompt(board_type) + _format_error_info(error)
         audio_cfg = load_config().get("audio", {}) or {}
         _voice_session = GeminiVoiceSession(
             system_prompt=prompt,
@@ -135,13 +156,17 @@ async def _execute_hover_stop() -> None:
     await _stop_voice_session()
 
 
-async def _update_voice_hover(any_hover: bool, board_type: str = "large") -> None:
+async def _update_voice_hover(
+    any_hover: bool,
+    board_type: str = "large",
+    error: list[float] | None = None,
+) -> None:
     global _hover_stop_handle
     if any_hover:
         if _hover_stop_handle is not None:
             _hover_stop_handle.cancel()
             _hover_stop_handle = None
-        await _start_voice_session(board_type)
+        await _start_voice_session(board_type, error)
     else:
         if _hover_stop_handle is None or _hover_stop_handle.cancelled():
             loop = asyncio.get_running_loop()
@@ -180,14 +205,17 @@ def _apply_points(points: list, errors: list | None, hovers: list | None) -> Non
     # Voice-Session steuern: starten/stoppen je nach Hand-über-Brett.
     any_hover = any(cleaned_hovers)
     board_type = "large"
+    hovered_error: list[float] | None = None
     for i, h in enumerate(cleaned_hovers):
         if h:
             quad = cleaned[i * 4 : i * 4 + 4]
             if len(quad) == 4:
                 board_type = _board_type(quad)
+            if i < len(cleaned_errors):
+                hovered_error = cleaned_errors[i]
             break
     asyncio.run_coroutine_threadsafe(
-        _update_voice_hover(any_hover, board_type), loop,
+        _update_voice_hover(any_hover, board_type, hovered_error), loop,
     )
 
 

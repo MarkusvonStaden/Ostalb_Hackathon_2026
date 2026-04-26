@@ -458,19 +458,15 @@ def process_frame(
         _LAST_DOTS = list(dots)
 
     # Hovers koennen wir direkt aus den bereits erkannten Landmarks
-    # ableiten, ohne MediaPipe ein zweites Mal zu rufen.
+    # ableiten, ohne MediaPipe ein zweites Mal zu rufen. Die Hand-Position
+    # wird NICHT in `errors` geschrieben - eine Hand ist kein blauer
+    # Klebepunkt. Solange eine Hand sichtbar ist, behalten wir die zuletzt
+    # bekannten blauen Punkte aus dem Cache (siehe `hand_present`-Zweig
+    # oben).
     if region is not None and result:
-        hovers, hover_points = _hovers_from_landmarks(hand_landmarks, (h, w), result)
+        hovers, _hover_points = _hovers_from_landmarks(hand_landmarks, (h, w), result)
     else:
         hovers = [False] * len(result)
-        hover_points = [None] * len(result)
-
-    # Wo eine Hand ueber einem Brett liegt, soll der Anzeigepunkt direkt an
-    # der Handposition erscheinen - das ueberschreibt den ggf. gecachten
-    # blauen Klebepunkt fuer dieses Brett.
-    for qi, hp in enumerate(hover_points):
-        if hp is not None and qi < len(errors):
-            errors[qi] = hp
 
     if not return_stages:
         return result, errors
