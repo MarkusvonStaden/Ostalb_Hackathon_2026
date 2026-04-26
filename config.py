@@ -21,6 +21,7 @@ DEFAULTS: dict[str, Any] = {
         "fps": 5,
         "enabled": True,
         "show_preview": False,
+        "show_camera_window": False,
         "contour_channel": "blue",
     },
     "server": {
@@ -63,6 +64,8 @@ def _env_overrides() -> dict[str, Any]:
         out["camera"]["enabled"] = False
     if "OSTALB_CONTOUR_CHANNEL" in env:
         out["camera"]["contour_channel"] = env["OSTALB_CONTOUR_CHANNEL"]
+    if "OSTALB_SHOW_CAMERA_WINDOW" in env:
+        out["camera"]["show_camera_window"] = env["OSTALB_SHOW_CAMERA_WINDOW"].lower() in {"1", "true", "yes", "on"}
     if "OSTALB_KIOSK_URL" in env:
         out["server"]["url"] = env["OSTALB_KIOSK_URL"]
     if "OSTALB_NO_KIOSK" in env and env["OSTALB_NO_KIOSK"] == "1":

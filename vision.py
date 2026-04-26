@@ -591,11 +591,14 @@ def run_capture_loop(
     rotate: int = 0,
     contour_channel: str = "blue",
     stop_event=None,
+    show_camera_window: bool = False,
 ) -> None:
     """Webcam-Loop ohne HTTP/Preview - ruft ``on_result(points, errors, hovers)``
     in-process auf. Geeignet, um direkt aus dem Server-Prozess zu laufen.
 
     ``stop_event`` (threading.Event) bricht die Schleife sauber ab.
+    ``show_camera_window`` zeigt zusaetzlich ein OpenCV-Fenster mit dem
+    rohen (rotierten) Kamerabild.
     """
     cap = _open_webcam(camera, width, height)
     period = 1.0 / max(0.1, fps)
@@ -604,7 +607,14 @@ def run_capture_loop(
         180: cv2.ROTATE_180,
         270: cv2.ROTATE_90_COUNTERCLOCKWISE,
     }.get(int(rotate) % 360)
-    print(f"[vision] Webcam {camera} geoeffnet (in-process, rotate={rotate}deg)")
+    cam_win_name = "camera (raw)"
+    if show_camera_window:
+        try:
+            cv2.namedWindow(cam_win_name, cv2.WINDOW_NORMAL)
+        except Exception as exc:
+            print(f"[vision] Kamera-Fenster konnte nicht erstellt werden: {exc}", file=__import__('sys').stderr)
+            show_camera_window = False
+    print(f"[vision] Webcam {camera} geoeffnet (in-process, rotate={rotate}deg, show_camera_window={show_camera_window})")
     last_send = 0.0
     try:
         while True:
@@ -616,6 +626,13 @@ def run_capture_loop(
                 continue
             if rot_code is not None:
                 frame = cv2.rotate(frame, rot_code)
+            if show_camera_window:
+                try:
+                    cv2.imshow(cam_win_name, frame)
+                    cv2.waitKey(1)
+                except Exception as exc:
+                    print(f"[vision] Kamera-Fenster Fehler: {exc}", file=__import__('sys').stderr)
+                    show_camera_window = False
             now = time.time()
             if now - last_send < period:
                 time.sleep(max(0.0, period - (now - last_send)))
@@ -635,6 +652,11 @@ def run_capture_loop(
                 print(f"[vision] Fehler: {exc}", file=__import__('sys').stderr)
     finally:
         cap.release()
+        if show_camera_window:
+            try:
+                cv2.destroyWindow(cam_win_name)
+            except Exception:
+                pass
 
 
 def run_webcam(

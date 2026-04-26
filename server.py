@@ -248,6 +248,7 @@ def _maybe_start_capture() -> None:
                 rotate=int(cam.get("rotate", 0)),
                 contour_channel=cam.get("contour_channel", "blue"),
                 stop_event=_capture_stop,
+                show_camera_window=bool(cam.get("show_camera_window", False)),
             )
         except Exception as exc:
             print(f"[server] Capture-Loop beendet: {exc}")
